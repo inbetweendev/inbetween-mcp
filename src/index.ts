@@ -96,10 +96,14 @@ function connectWebSocket(): void {
           metadata: event.metadata || {},
           sent_at: event.sent_at,
         };
-        inbox.unshift(msg);
-        if (inbox.length > MAX_INBOX_SIZE) inbox.pop();
+        if (!inbox.find((m) => m.message_id === msg.message_id)) {
+          inbox.unshift(msg);
+          if (inbox.length > MAX_INBOX_SIZE) inbox.pop();
+        }
 
-        if (messageNotifier) messageNotifier(msg);
+        notifyClaudeAboutMessage(msg);
+      } else if (event.type === "heartbeat_ack") {
+        // OK
       }
     } catch (e) {
       console.error("[agentgram] Failed to parse WS message:", e);
@@ -107,14 +111,82 @@ function connectWebSocket(): void {
   });
 
   ws.on("close", () => {
-    console.error("[agentgram] WS disconnected, reconnecting...");
+    console.error("[agentgram] WS disconnected, reconnecting in 3s...");
     if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(connectWebSocket, 5000);
+    reconnectTimer = setTimeout(connectWebSocket, 3000);
   });
 
   ws.on("error", (err) => {
     console.error("[agentgram] WS error:", err.message);
   });
+}
+
+// =================================================================
+// PROACTIVE NOTIFICATIONS to Claude Code
+// =================================================================
+async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
+  try {
+    // 1. Mark inbox resource as updated — Claude will see resource change
+    await server.notification({
+      method: "notifications/resources/list_changed",
+      params: {},
+    });
+
+    // 2. Notify resource specifically
+    await server.notification({
+      method: "notifications/resources/updated",
+      params: { uri: "agentgram://inbox" },
+    });
+
+    // 3. Log message — surfaces in Claude Code UI
+    await server.notification({
+      method: "notifications/message",
+      params: {
+        level: "info",
+        logger: "agentgram",
+        data: `📨 New message from @${msg.from_agent}: ${msg.content.slice(0, 200)}${msg.content.length > 200 ? "..." : ""}`,
+      },
+    });
+  } catch (e) {
+    console.error("[agentgram] Failed to notify Claude:", e);
+  }
+}
+
+// =================================================================
+// POLLING FALLBACK (если WebSocket не работает)
+// =================================================================
+let lastSeenMessageId: string | null = null;
+
+async function pollInbox(): Promise<void> {
+  try {
+    const result = await api<any>("GET", "/inbox?pending_only=true&limit=20");
+    const messages: any[] = result.messages || [];
+
+    for (const m of messages.reverse()) {
+      // Дедуп через локальный inbox
+      if (inbox.find((x) => x.message_id === m.message_id)) continue;
+
+      const msg: Message = {
+        message_id: m.message_id,
+        from_agent: m.from_agent,
+        content: m.content,
+        attachments: m.attachments || [],
+        metadata: m.metadata || {},
+        sent_at: m.sent_at,
+      };
+      inbox.unshift(msg);
+      if (inbox.length > MAX_INBOX_SIZE) inbox.pop();
+
+      await notifyClaudeAboutMessage(msg);
+    }
+  } catch (e) {
+    // silent — обычная сетевая ошибка
+  }
+}
+
+function startPolling(): void {
+  // Polling каждые 8 сек как fallback к WebSocket
+  setInterval(pollInbox, 8000);
 }
 
 // =================================================================
@@ -326,6 +398,9 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 // =================================================================
 async function main() {
   console.error(`[agentgram] Starting MCP server for @${AGENT_NAME}`);
+
+  // Start polling fallback (8s interval)
+  startPolling();
 
   // Start WebSocket
   connectWebSocket();
