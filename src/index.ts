@@ -126,27 +126,31 @@ function connectWebSocket(): void {
 // =================================================================
 async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
   try {
-    // 1. Mark inbox resource as updated — Claude will see resource change
+    // 1. Resource list changed — Claude refreshes resource list
     await server.notification({
       method: "notifications/resources/list_changed",
       params: {},
     });
 
-    // 2. Notify resource specifically
+    // 2. Inbox resource specifically updated — для subscribed clients
     await server.notification({
       method: "notifications/resources/updated",
       params: { uri: "agentgram://inbox" },
     });
 
-    // 3. Log message — surfaces in Claude Code UI
+    // 3. Log notification with WARNING level (более visible в Claude Code UI)
     await server.notification({
       method: "notifications/message",
       params: {
-        level: "info",
+        level: "warning",
         logger: "agentgram",
-        data: `📨 New message from @${msg.from_agent}: ${msg.content.slice(0, 200)}${msg.content.length > 200 ? "..." : ""}`,
+        data: `📨 NEW MESSAGE from @${msg.from_agent}: ${msg.content.slice(0, 300)}${msg.content.length > 300 ? "..." : ""}`,
       },
     });
+
+    console.error(
+      `[agentgram] 📨 Notified Claude of message from @${msg.from_agent}`
+    );
   } catch (e) {
     console.error("[agentgram] Failed to notify Claude:", e);
   }
@@ -241,7 +245,16 @@ async function searchAgents(query: string) {
 // =================================================================
 const server = new Server(
   { name: "agentgram", version: "0.1.0" },
-  { capabilities: { tools: {}, resources: {} } }
+  {
+    capabilities: {
+      tools: {},
+      resources: {
+        subscribe: true,
+        listChanged: true,
+      },
+      logging: {},
+    },
+  }
 );
 
 // === TOOLS ===
@@ -344,22 +357,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 // === RESOURCES ===
+const subscribedUris = new Set<string>();
+
 server.setRequestHandler(ListResourcesRequestSchema, async () => ({
   resources: [
     {
       uri: "agentgram://inbox",
       name: "AgentGram Inbox",
-      description: `All messages received by @${AGENT_NAME}`,
+      description: `All messages received by @${AGENT_NAME}. Check this for incoming agent messages.`,
       mimeType: "application/json",
     },
     {
       uri: "agentgram://profile",
-      name: "My Profile",
-      description: `Profile of @${AGENT_NAME}`,
+      name: "My AgentGram Profile",
+      description: `Profile of @${AGENT_NAME} — agent name + pending message count`,
       mimeType: "application/json",
     },
   ],
 }));
+
+// Subscribe handler — Claude Code calls this to subscribe к resource updates
+server.setRequestHandler(
+  // Manually create schema since SDK might not expose it directly
+  { method: "resources/subscribe" } as any,
+  async (request: any) => {
+    const uri = request.params?.uri;
+    if (uri) {
+      subscribedUris.add(uri);
+      console.error(`[agentgram] Subscribed to ${uri}`);
+    }
+    return {};
+  }
+);
+
+server.setRequestHandler(
+  { method: "resources/unsubscribe" } as any,
+  async (request: any) => {
+    const uri = request.params?.uri;
+    if (uri) {
+      subscribedUris.delete(uri);
+    }
+    return {};
+  }
+);
 
 server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const { uri } = request.params;
@@ -378,13 +418,30 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   }
 
   if (uri === "agentgram://profile") {
-    const profile = await fetch(`${BACKEND_URL}/agents/${AGENT_NAME}`);
+    const [profileRes, inboxRes] = await Promise.all([
+      fetch(`${BACKEND_URL}/agents/${AGENT_NAME}`),
+      fetchInbox(true).catch(() => ({ messages: [] })),
+    ]);
+    const profile = await profileRes.json();
+    const pending = (inboxRes as any).messages || [];
     return {
       contents: [
         {
           uri,
           mimeType: "application/json",
-          text: await profile.text(),
+          text: JSON.stringify(
+            {
+              ...profile,
+              pending_messages_count: pending.length,
+              pending_preview: pending.slice(0, 3).map((m: any) => ({
+                from: m.from_agent,
+                preview: (m.content || "").slice(0, 100),
+                sent_at: m.sent_at,
+              })),
+            },
+            null,
+            2
+          ),
         },
       ],
     };
