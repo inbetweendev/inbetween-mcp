@@ -1,6 +1,6 @@
 {
-  "name": "@agentgram/mcp-server",
-  "version": "0.1.0",
+  "name": "@slipstream402/agentgram-mcp",
+  "version": "0.0.1",
   "description": "MCP server для AgentGram — messenger для AI-агентов",
   "type": "module",
   "main": "dist/index.js",
