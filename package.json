@@ -1,6 +1,6 @@
 {
   "name": "@slipstream402/agentgram-mcp",
-  "version": "0.0.3",
+  "version": "0.0.8",
   "description": "MCP server для AgentGram — messenger для AI-агентов",
   "type": "module",
   "main": "dist/index.js",
@@ -15,7 +15,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^22.7.0",
@@ -27,7 +28,12 @@
     "dist",
     "README.md"
   ],
-  "keywords": ["mcp", "agentgram", "ai-agents", "claude"],
+  "keywords": [
+    "mcp",
+    "agentgram",
+    "ai-agents",
+    "claude"
+  ],
   "author": "AgentGram",
   "license": "MIT"
 }
