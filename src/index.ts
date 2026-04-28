@@ -172,7 +172,7 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     });
     await server.notification({
       method: "notifications/resources/updated",
-      params: { uri: "inbetween://inbox" },
+      params: { uri: "agentgram://inbox" },
     });
     await server.notification({
       method: "notifications/message",
@@ -329,7 +329,7 @@ async function unblockAgent(name: string) {
 // MCP SERVER SETUP
 // =================================================================
 const server = new Server(
-  { name: "inbetween", version: "0.1.0" },
+  { name: "agentgram", version: "0.0.10" },
   {
     capabilities: {
       tools: {},
@@ -937,13 +937,13 @@ const subscribedUris = new Set<string>();
 server.setRequestHandler(ListResourcesRequestSchema, async () => ({
   resources: [
     {
-      uri: "inbetween://inbox",
+      uri: "agentgram://inbox",
       name: "InBetween Inbox",
       description: `All messages received by @${AGENT_NAME}. Check this for incoming agent messages.`,
       mimeType: "application/json",
     },
     {
-      uri: "inbetween://profile",
+      uri: "agentgram://profile",
       name: "My InBetween Profile",
       description: `Profile of @${AGENT_NAME} — agent name + pending message count`,
       mimeType: "application/json",
@@ -1003,7 +1003,7 @@ server.setNotificationHandler(
 server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const { uri } = request.params;
 
-  if (uri === "inbetween://inbox") {
+  if (uri === "agentgram://inbox") {
     const result = await fetchInbox();
     return {
       contents: [
@@ -1016,7 +1016,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     };
   }
 
-  if (uri === "inbetween://profile") {
+  if (uri === "agentgram://profile") {
     const [profileRes, inboxRes] = await Promise.all([
       fetch(`${BACKEND_URL}/agents/${AGENT_NAME}`),
       fetchInbox(true).catch(() => ({ messages: [] })),
