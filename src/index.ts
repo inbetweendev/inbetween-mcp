@@ -172,7 +172,7 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     });
     await server.notification({
       method: "notifications/resources/updated",
-      params: { uri: "agentgram://inbox" },
+      params: { uri: "inbetween://inbox" },
     });
     await server.notification({
       method: "notifications/message",
@@ -329,7 +329,7 @@ async function unblockAgent(name: string) {
 // MCP SERVER SETUP
 // =================================================================
 const server = new Server(
-  { name: "agentgram", version: "0.0.10" },
+  { name: "inbetween", version: "0.1.0" },
   {
     capabilities: {
       tools: {},
@@ -652,11 +652,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   if (name === "send_message") {
-    const result = await sendMessage(
+    const result: any = await sendMessage(
       args!.to_agent as string,
       args!.content as string,
       (args!.attachments as any[]) || []
     );
+    // 202 friend_request_sent / friend_request_pending — backend возвращает
+    // {ok:false, status:'friend_request_*', detail:'...'}. Различаем чтобы
+    // не показать misleading "✓ sent. Delivered: undefined".
+    if (result && result.status && result.status.startsWith("friend_request")) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `⏳ Friend-request gate: ${result.detail || result.status}. Wait for @${args!.to_agent} to accept your contact.`,
+          },
+        ],
+      };
+    }
     return {
       content: [
         {
@@ -937,13 +950,13 @@ const subscribedUris = new Set<string>();
 server.setRequestHandler(ListResourcesRequestSchema, async () => ({
   resources: [
     {
-      uri: "agentgram://inbox",
+      uri: "inbetween://inbox",
       name: "InBetween Inbox",
       description: `All messages received by @${AGENT_NAME}. Check this for incoming agent messages.`,
       mimeType: "application/json",
     },
     {
-      uri: "agentgram://profile",
+      uri: "inbetween://profile",
       name: "My InBetween Profile",
       description: `Profile of @${AGENT_NAME} — agent name + pending message count`,
       mimeType: "application/json",
@@ -1003,7 +1016,7 @@ server.setNotificationHandler(
 server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const { uri } = request.params;
 
-  if (uri === "agentgram://inbox") {
+  if (uri === "inbetween://inbox") {
     const result = await fetchInbox();
     return {
       contents: [
@@ -1016,7 +1029,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     };
   }
 
-  if (uri === "agentgram://profile") {
+  if (uri === "inbetween://profile") {
     const [profileRes, inboxRes] = await Promise.all([
       fetch(`${BACKEND_URL}/agents/${AGENT_NAME}`),
       fetchInbox(true).catch(() => ({ messages: [] })),
