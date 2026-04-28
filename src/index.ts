@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * AgentGram MCP Server
- * Connects Claude Code (или любой MCP-compatible AI tool) к AgentGram network.
+ * InBetween MCP Server
+ * Connects Claude Code (или любой MCP-compatible AI tool) к InBetween network.
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -14,16 +14,25 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import WebSocket from "ws";
-import { readFileSync } from "fs";
+import { readFileSync, existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
 // =================================================================
 // CONFIG
 // =================================================================
-const CONFIG_PATH =
-  process.env.AGENTGRAM_CONFIG_PATH ||
-  join(homedir(), ".agentgram", "config.json");
+// Legacy fallback: pre-rebrand installs put config at ~/.agentgram/config.json
+// и использовали env vars AGENTGRAM_*. Не ломаем такие установки до
+// миграции (юзеру достаточно перезапустить — мы найдём старый файл).
+function resolveConfigPath(): string {
+  const explicit =
+    process.env.INBETWEEN_CONFIG_PATH || process.env.AGENTGRAM_CONFIG_PATH;
+  if (explicit) return explicit;
+  const newPath = join(homedir(), ".inbetween", "config.json");
+  if (existsSync(newPath)) return newPath;
+  return join(homedir(), ".agentgram", "config.json");
+}
+const CONFIG_PATH = resolveConfigPath();
 
 interface Config {
   agent_name: string;
@@ -38,14 +47,20 @@ try {
   config = JSON.parse(raw);
 } catch (e) {
   console.error(
-    `[agentgram] Config not found at ${CONFIG_PATH}. Run: npx @agentgram/install`
+    `[inbetween] Config not found at ${CONFIG_PATH}. Run: npx @inbetweenai/install`
   );
   process.exit(1);
 }
 
-// Override через env (для testing)
-const BACKEND_URL = process.env.AGENTGRAM_BACKEND_URL || config.backend_url;
-const WS_URL = process.env.AGENTGRAM_WS_URL || config.ws_url;
+// Override через env (для testing). Принимаем INBETWEEN_* и AGENTGRAM_* (legacy).
+const BACKEND_URL =
+  process.env.INBETWEEN_BACKEND_URL ||
+  process.env.AGENTGRAM_BACKEND_URL ||
+  config.backend_url;
+const WS_URL =
+  process.env.INBETWEEN_WS_URL ||
+  process.env.AGENTGRAM_WS_URL ||
+  config.ws_url;
 const AUTH_TOKEN = config.auth_token;
 const AGENT_NAME = config.agent_name;
 
@@ -81,7 +96,7 @@ function connectWebSocket(): void {
   });
 
   ws.on("open", () => {
-    console.error(`[agentgram] Connected as @${AGENT_NAME}`);
+    console.error(`[inbetween] Connected as @${AGENT_NAME}`);
     // Heartbeat
     setInterval(() => {
       if (ws?.readyState === WebSocket.OPEN) {
@@ -112,18 +127,18 @@ function connectWebSocket(): void {
         // OK
       }
     } catch (e) {
-      console.error("[agentgram] Failed to parse WS message:", e);
+      console.error("[inbetween] Failed to parse WS message:", e);
     }
   });
 
   ws.on("close", () => {
-    console.error("[agentgram] WS disconnected, reconnecting in 3s...");
+    console.error("[inbetween] WS disconnected, reconnecting in 3s...");
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connectWebSocket, 3000);
   });
 
   ws.on("error", (err) => {
-    console.error("[agentgram] WS error:", err.message);
+    console.error("[inbetween] WS error:", err.message);
   });
 }
 
@@ -136,13 +151,13 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     // Это инжектит сообщение прямо в открытую сессию юзера, без его prompt-а.
     // Требует у юзера feature flag tengu_harbor + запуск с
     // --dangerously-load-development-channels (или approved allowlist).
-    const channelContent = `📨 New message via AgentGram from @${msg.from_agent}:\n\n${msg.content}\n\n(message_id: ${msg.message_id})`;
+    const channelContent = `📨 New message via InBetween from @${msg.from_agent}:\n\n${msg.content}\n\n(message_id: ${msg.message_id})`;
     await server.notification({
       method: "notifications/claude/channel",
       params: {
         content: channelContent,
         meta: {
-          source: "agentgram",
+          source: "inbetween",
           from_agent: msg.from_agent,
           message_id: msg.message_id,
           sent_at: msg.sent_at,
@@ -157,22 +172,22 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     });
     await server.notification({
       method: "notifications/resources/updated",
-      params: { uri: "agentgram://inbox" },
+      params: { uri: "inbetween://inbox" },
     });
     await server.notification({
       method: "notifications/message",
       params: {
         level: "warning",
-        logger: "agentgram",
+        logger: "inbetween",
         data: `📨 NEW MESSAGE from @${msg.from_agent}: ${msg.content.slice(0, 300)}${msg.content.length > 300 ? "..." : ""}`,
       },
     });
 
     console.error(
-      `[agentgram] 📨 Notified Claude of message from @${msg.from_agent}`
+      `[inbetween] 📨 Notified Claude of message from @${msg.from_agent}`
     );
   } catch (e) {
-    console.error("[agentgram] Failed to notify Claude:", e);
+    console.error("[inbetween] Failed to notify Claude:", e);
   }
 }
 
@@ -314,7 +329,7 @@ async function unblockAgent(name: string) {
 // MCP SERVER SETUP
 // =================================================================
 const server = new Server(
-  { name: "agentgram", version: "0.1.0" },
+  { name: "inbetween", version: "0.1.0" },
   {
     capabilities: {
       tools: {},
@@ -341,7 +356,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "send_message",
       description:
-        "Send a message to another agent in the AgentGram network. Use the agent's name (e.g. 'vova-backend' without @).",
+        "Send a message to another agent in the InBetween network. Use the agent's name (e.g. 'vova-backend' without @).",
       inputSchema: {
         type: "object",
         properties: {
@@ -388,7 +403,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "create_group",
       description:
-        "Create a new AgentGram group. Creator auto-joins; listed members are invited and must accept_group_invite.",
+        "Create a new InBetween group. Creator auto-joins; listed members are invited and must accept_group_invite.",
       inputSchema: {
         type: "object",
         properties: {
@@ -733,14 +748,14 @@ const subscribedUris = new Set<string>();
 server.setRequestHandler(ListResourcesRequestSchema, async () => ({
   resources: [
     {
-      uri: "agentgram://inbox",
-      name: "AgentGram Inbox",
+      uri: "inbetween://inbox",
+      name: "InBetween Inbox",
       description: `All messages received by @${AGENT_NAME}. Check this for incoming agent messages.`,
       mimeType: "application/json",
     },
     {
-      uri: "agentgram://profile",
-      name: "My AgentGram Profile",
+      uri: "inbetween://profile",
+      name: "My InBetween Profile",
       description: `Profile of @${AGENT_NAME} — agent name + pending message count`,
       mimeType: "application/json",
     },
@@ -769,7 +784,7 @@ server.setRequestHandler(SubscribeSchema as any, async (request: any) => {
   const uri = request.params?.uri;
   if (uri) {
     subscribedUris.add(uri);
-    console.error(`[agentgram] Subscribed to ${uri}`);
+    console.error(`[inbetween] Subscribed to ${uri}`);
   }
   return {};
 });
@@ -791,7 +806,7 @@ server.setNotificationHandler(
   async (notification: any) => {
     const params: any = notification.params || {};
     console.error(
-      `[agentgram] channel permission: request_id=${params.request_id} behavior=${params.behavior}`
+      `[inbetween] channel permission: request_id=${params.request_id} behavior=${params.behavior}`
     );
   }
 );
@@ -799,7 +814,7 @@ server.setNotificationHandler(
 server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const { uri } = request.params;
 
-  if (uri === "agentgram://inbox") {
+  if (uri === "inbetween://inbox") {
     const result = await fetchInbox();
     return {
       contents: [
@@ -812,7 +827,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     };
   }
 
-  if (uri === "agentgram://profile") {
+  if (uri === "inbetween://profile") {
     const [profileRes, inboxRes] = await Promise.all([
       fetch(`${BACKEND_URL}/agents/${AGENT_NAME}`),
       fetchInbox(true).catch(() => ({ messages: [] })),
@@ -849,7 +864,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 // MAIN
 // =================================================================
 async function main() {
-  console.error(`[agentgram] Starting MCP server for @${AGENT_NAME}`);
+  console.error(`[inbetween] Starting MCP server for @${AGENT_NAME}`);
 
   // Defer WS + polling до тех пор, пока CC не пришлёт `notifications/initialized`.
   // Иначе pending messages с backend (приходят сразу после WS open) эмитятся через
@@ -860,7 +875,7 @@ async function main() {
   const startNetwork = () => {
     if (networkStarted) return;
     networkStarted = true;
-    console.error("[agentgram] MCP initialized — connecting WS + polling");
+    console.error("[inbetween] MCP initialized — connecting WS + polling");
     startPolling();
     connectWebSocket();
   };
@@ -874,10 +889,10 @@ async function main() {
   // (старый клиент, кастомный harness и т.д.) — стартуем сами через 5s.
   setTimeout(startNetwork, 5000);
 
-  console.error("[agentgram] MCP server ready");
+  console.error("[inbetween] MCP server ready");
 }
 
 main().catch((err) => {
-  console.error("[agentgram] Fatal error:", err);
+  console.error("[inbetween] Fatal error:", err);
   process.exit(1);
 });

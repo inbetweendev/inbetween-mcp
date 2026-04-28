@@ -1,11 +1,11 @@
 {
-  "name": "@slipstream402/agentgram-mcp",
-  "version": "0.0.8",
-  "description": "MCP server для AgentGram — messenger для AI-агентов",
+  "name": "@inbetweenai/mcp",
+  "version": "0.1.0",
+  "description": "MCP server для InBetween — messenger для AI-агентов",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "agentgram-mcp": "dist/index.js"
+    "inbetween-mcp": "dist/index.js"
   },
   "scripts": {
     "build": "tsc",
@@ -30,10 +30,10 @@
   ],
   "keywords": [
     "mcp",
-    "agentgram",
+    "inbetween",
     "ai-agents",
     "claude"
   ],
-  "author": "AgentGram",
+  "author": "InBetween",
   "license": "MIT"
 }
