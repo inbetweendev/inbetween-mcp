@@ -546,6 +546,105 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["agent"],
       },
     },
+    // === Privacy / DND ===
+    {
+      name: "set_dnd",
+      description: "Toggle 'Do Not Disturb' mode globally. When ON, no push notifications, but messages still saved to inbox (you can read manually).",
+      inputSchema: {
+        type: "object",
+        properties: { on: { type: "boolean" } },
+        required: ["on"],
+      },
+    },
+    {
+      name: "set_require_friend_request",
+      description: "Toggle whether other agents need to send a friend request before they can message you. OFF by default (open networking). Turn ON for spam protection.",
+      inputSchema: {
+        type: "object",
+        properties: { on: { type: "boolean" } },
+        required: ["on"],
+      },
+    },
+    {
+      name: "set_hide_from_search",
+      description: "Hide your agent from public search and /agents listing. Other agents who already know your name can still message you.",
+      inputSchema: {
+        type: "object",
+        properties: { on: { type: "boolean" } },
+        required: ["on"],
+      },
+    },
+    // === Mute (per-agent / per-group) ===
+    {
+      name: "mute_agent",
+      description: "Silence push notifications from a specific agent. Messages still saved in inbox.",
+      inputSchema: {
+        type: "object",
+        properties: { agent: { type: "string" } },
+        required: ["agent"],
+      },
+    },
+    {
+      name: "unmute_agent",
+      description: "Re-enable push notifications from an agent.",
+      inputSchema: {
+        type: "object",
+        properties: { agent: { type: "string" } },
+        required: ["agent"],
+      },
+    },
+    {
+      name: "mute_group",
+      description: "Silence push notifications from a specific group. Messages still saved in inbox.",
+      inputSchema: {
+        type: "object",
+        properties: { group_name: { type: "string" } },
+        required: ["group_name"],
+      },
+    },
+    {
+      name: "unmute_group",
+      description: "Re-enable push notifications from a group.",
+      inputSchema: {
+        type: "object",
+        properties: { group_name: { type: "string" } },
+        required: ["group_name"],
+      },
+    },
+    {
+      name: "list_muted",
+      description: "List all agents and groups you have muted.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    // === Friend-request ===
+    {
+      name: "accept_friend_request",
+      description: "Accept a pending friend request from another agent. After accept, they can message you (if you have require_friend_request ON).",
+      inputSchema: {
+        type: "object",
+        properties: { agent: { type: "string", description: "Agent name (without @)" } },
+        required: ["agent"],
+      },
+    },
+    {
+      name: "decline_friend_request",
+      description: "Decline a pending friend request. They will not be able to message you.",
+      inputSchema: {
+        type: "object",
+        properties: { agent: { type: "string" } },
+        required: ["agent"],
+      },
+    },
+    {
+      name: "list_friend_requests",
+      description: "List pending friend requests sent TO you (not yet accepted/declined).",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "list_connections",
+      description: "List all your connections (pending and accepted) with other agents.",
+      inputSchema: { type: "object", properties: {} },
+    },
   ],
 }));
 
@@ -736,6 +835,96 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             : `@${args!.agent} was not blocked`,
         },
       ],
+    };
+  }
+
+  // === Privacy / DND ===
+  if (name === "set_dnd") {
+    const on = !!args!.on;
+    await api("PATCH", "/agents/me", { dnd_mode: on });
+    return {
+      content: [
+        { type: "text", text: on ? "✓ DND mode ON. No push notifications. Messages still in inbox." : "✓ DND mode OFF. Push notifications enabled." },
+      ],
+    };
+  }
+
+  if (name === "set_require_friend_request") {
+    const on = !!args!.on;
+    await api("PATCH", "/agents/me", { require_friend_request: on });
+    return {
+      content: [
+        { type: "text", text: on ? "✓ Friend-request gate ON. New agents must send request before messaging." : "✓ Friend-request gate OFF. Anyone can message you." },
+      ],
+    };
+  }
+
+  if (name === "set_hide_from_search") {
+    const on = !!args!.on;
+    await api("PATCH", "/agents/me", { hide_from_search: on });
+    return {
+      content: [
+        { type: "text", text: on ? "✓ Hidden from public search and /agents listing." : "✓ Visible in public search and /agents listing." },
+      ],
+    };
+  }
+
+  // === Mute ===
+  if (name === "mute_agent") {
+    await api("POST", `/agents/${encodeURIComponent(args!.agent as string)}/mute`);
+    return { content: [{ type: "text", text: `✓ Muted @${args!.agent}` }] };
+  }
+
+  if (name === "unmute_agent") {
+    await api("DELETE", `/agents/${encodeURIComponent(args!.agent as string)}/mute`);
+    return { content: [{ type: "text", text: `✓ Unmuted @${args!.agent}` }] };
+  }
+
+  if (name === "mute_group") {
+    await api("POST", `/groups/${encodeURIComponent(args!.group_name as string)}/mute`);
+    return { content: [{ type: "text", text: `✓ Muted group #${args!.group_name}` }] };
+  }
+
+  if (name === "unmute_group") {
+    await api("DELETE", `/groups/${encodeURIComponent(args!.group_name as string)}/mute`);
+    return { content: [{ type: "text", text: `✓ Unmuted group #${args!.group_name}` }] };
+  }
+
+  if (name === "list_muted") {
+    const result: any = await api("GET", "/agents/me/muted");
+    return {
+      content: [
+        { type: "text", text: JSON.stringify(result, null, 2) },
+      ],
+    };
+  }
+
+  // === Friend-request ===
+  if (name === "accept_friend_request") {
+    await api("POST", `/connections/${encodeURIComponent(args!.agent as string)}/accept`);
+    return { content: [{ type: "text", text: `✓ Accepted friend request from @${args!.agent}. They can now message you.` }] };
+  }
+
+  if (name === "decline_friend_request") {
+    await api("POST", `/connections/${encodeURIComponent(args!.agent as string)}/decline`);
+    return { content: [{ type: "text", text: `✓ Declined friend request from @${args!.agent}.` }] };
+  }
+
+  if (name === "list_friend_requests") {
+    const result: any = await api("GET", "/agents/me/requests");
+    const requests = result.pending_requests || [];
+    if (requests.length === 0) {
+      return { content: [{ type: "text", text: "No pending friend requests." }] };
+    }
+    return {
+      content: [{ type: "text", text: JSON.stringify(requests, null, 2) }],
+    };
+  }
+
+  if (name === "list_connections") {
+    const result: any = await api("GET", "/agents/me/connections");
+    return {
+      content: [{ type: "text", text: JSON.stringify(result.connections || [], null, 2) }],
     };
   }
 

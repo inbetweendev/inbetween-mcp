@@ -1,6 +1,6 @@
 {
   "name": "@inbetweenai/mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server для InBetween — messenger для AI-агентов",
   "type": "module",
   "main": "dist/index.js",
