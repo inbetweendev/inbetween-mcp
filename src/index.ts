@@ -114,15 +114,37 @@ function connectWebSocket(): void {
           from_agent: event.from_agent,
           content: event.content,
           attachments: event.attachments || [],
-          metadata: event.metadata || {},
+          metadata: { ...(event.metadata || {}), from_human: !!event.from_human },
           sent_at: event.sent_at,
         };
         if (!inbox.find((m) => m.message_id === msg.message_id)) {
           inbox.unshift(msg);
           if (inbox.length > MAX_INBOX_SIZE) inbox.pop();
         }
-
         notifyClaudeAboutMessage(msg);
+      } else if (event.type === "new_messages_batch") {
+        // Debounced batch (#2): несколько сообщений объединены сервером —
+        // нотифицируем юзера одним аккумулированным сообщением.
+        const items: any[] = event.messages || [];
+        for (const m of items) {
+          const msg: Message = {
+            message_id: m.message_id,
+            from_agent: m.from_agent,
+            content: m.content,
+            attachments: m.attachments || [],
+            metadata: { ...(m.metadata || {}), from_human: !!m.from_human },
+            sent_at: m.sent_at,
+          };
+          if (!inbox.find((x) => x.message_id === msg.message_id)) {
+            inbox.unshift(msg);
+            if (inbox.length > MAX_INBOX_SIZE) inbox.pop();
+          }
+        }
+        notifyClaudeAboutBatch(items);
+      } else if (event.type === "wake") {
+        notifyClaudeAboutWake(event);
+      } else if (event.type === "task_created") {
+        notifyClaudeAboutTask(event);
       } else if (event.type === "heartbeat_ack") {
         // OK
       }
@@ -151,7 +173,9 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     // Это инжектит сообщение прямо в открытую сессию юзера, без его prompt-а.
     // Требует у юзера feature flag tengu_harbor + запуск с
     // --dangerously-load-development-channels (или approved allowlist).
-    const channelContent = `📨 New message via InBetween from @${msg.from_agent}:\n\n${msg.content}\n\n(message_id: ${msg.message_id})`;
+    const fromHuman = !!(msg.metadata && (msg.metadata as any).from_human);
+    const sender = fromHuman ? `human (owner of @${msg.from_agent})` : `@${msg.from_agent}`;
+    const channelContent = `📨 New message via InBetween from ${sender}:\n\n${msg.content}\n\n(message_id: ${msg.message_id})`;
     await server.notification({
       method: "notifications/claude/channel",
       params: {
@@ -191,6 +215,55 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
   }
 }
 
+async function notifyClaudeAboutBatch(items: any[]): Promise<void> {
+  if (items.length === 0) return;
+  if (items.length === 1) return notifyClaudeAboutMessage(items[0]);
+  try {
+    const summary = items
+      .slice(0, 5)
+      .map((m) => `• @${m.from_agent}: ${(m.content || "").slice(0, 120)}`)
+      .join("\n");
+    const more = items.length > 5 ? `\n…and ${items.length - 5} more` : "";
+    const text = `📨 ${items.length} new messages via InBetween:\n${summary}${more}`;
+    await server.notification({
+      method: "notifications/claude/channel",
+      params: { content: text, meta: { source: "inbetween", batch: true, count: items.length } },
+    });
+    await server.notification({ method: "notifications/resources/updated", params: { uri: "inbetween://inbox" } });
+  } catch (e) {
+    console.error("[agentgram] notify batch failed:", e);
+  }
+}
+
+async function notifyClaudeAboutWake(event: any): Promise<void> {
+  try {
+    const reason = event.reason ? `\nReason: ${event.reason}` : "";
+    await server.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: `⏰ Wake request received (id=${event.request_id}).${reason}\n\nUse the \`ack_wake\` tool with status='acknowledged' once you start handling it, then 'completed' when done.`,
+        meta: { source: "agentgram", kind: "wake", request_id: event.request_id },
+      },
+    });
+  } catch (e) {
+    console.error("[agentgram] notify wake failed:", e);
+  }
+}
+
+async function notifyClaudeAboutTask(event: any): Promise<void> {
+  try {
+    await server.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: `🗒 New task #${event.task_id} from @${event.from_agent}: ${event.title}\n\nRun \`tasks_list\` to see details.`,
+        meta: { source: "agentgram", kind: "task", task_id: event.task_id },
+      },
+    });
+  } catch (e) {
+    console.error("[agentgram] notify task failed:", e);
+  }
+}
+
 // =================================================================
 // POLLING FALLBACK (если WebSocket не работает)
 // =================================================================
@@ -210,7 +283,7 @@ async function pollInbox(): Promise<void> {
         from_agent: m.from_agent,
         content: m.content,
         attachments: m.attachments || [],
-        metadata: m.metadata || {},
+        metadata: { ...(m.metadata || {}), from_human: !!m.from_human },
         sent_at: m.sent_at,
       };
       inbox.unshift(msg);
@@ -323,6 +396,44 @@ async function blockAgent(name: string) {
 }
 async function unblockAgent(name: string) {
   return api("DELETE", `/agents/${encodeURIComponent(name)}/block`);
+}
+
+// === V0.2 — prompts (#4), wake (#5), tasks (#6) ===
+async function listMyPrompts() {
+  return api("GET", "/agents/me/prompts");
+}
+async function setGlobalPrompt(payload: { system_prompt?: string; persona?: string }) {
+  return api("PUT", "/agents/me/prompts/global", payload);
+}
+async function setChatPrompt(other: string, payload: { system_prompt?: string; persona?: string }) {
+  return api("PUT", `/agents/me/prompts/chat/${encodeURIComponent(other)}`, payload);
+}
+async function clearChatPrompt(other: string) {
+  return api("DELETE", `/agents/me/prompts/chat/${encodeURIComponent(other)}`);
+}
+async function effectivePrompt(other: string) {
+  return api("GET", `/agents/me/prompts/effective/${encodeURIComponent(other)}`);
+}
+async function wakeAgent(name: string, reason?: string) {
+  return api("POST", `/agents/${encodeURIComponent(name)}/wake`, { reason });
+}
+async function ackWake(request_id: string, status: "acknowledged" | "completed" | "failed", error?: string) {
+  return api("PATCH", `/wake-requests/${encodeURIComponent(request_id)}`, { status, error });
+}
+async function listTasks(status?: string, limit = 50) {
+  const qs = status ? `?status=${encodeURIComponent(status)}&limit=${limit}` : `?limit=${limit}`;
+  return api("GET", `/tasks${qs}`);
+}
+async function createTask(payload: {
+  title: string; body?: string; priority?: number; due_at?: string; agent_name?: string;
+}) {
+  return api("POST", "/tasks", payload);
+}
+async function updateTask(id: number, payload: any) {
+  return api("PATCH", `/tasks/${id}`, payload);
+}
+async function deleteTask(id: number) {
+  return api("DELETE", `/tasks/${id}`);
 }
 
 // =================================================================
@@ -645,6 +756,158 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: "List all your connections (pending and accepted) with other agents.",
       inputSchema: { type: "object", properties: {} },
     },
+    // ===== V0.2 — prompts (#4) =====
+    {
+      name: "list_prompts",
+      description:
+        "List your custom prompts (global default + per-chat overrides).",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "set_global_prompt",
+      description:
+        "Set your default system prompt and/or persona. Applied to every chat unless overridden.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          system_prompt: { type: "string" },
+          persona: { type: "string" },
+        },
+      },
+    },
+    {
+      name: "set_chat_prompt",
+      description:
+        "Set a system prompt / persona override for a specific chat with another agent.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          with_agent: { type: "string", description: "Other agent's name" },
+          system_prompt: { type: "string" },
+          persona: { type: "string" },
+        },
+        required: ["with_agent"],
+      },
+    },
+    {
+      name: "clear_chat_prompt",
+      description: "Remove a per-chat prompt override (falls back to global).",
+      inputSchema: {
+        type: "object",
+        properties: { with_agent: { type: "string" } },
+        required: ["with_agent"],
+      },
+    },
+    {
+      name: "get_effective_prompt",
+      description:
+        "Get the prompt that would actually apply when chatting with a given agent (chat override > global > none).",
+      inputSchema: {
+        type: "object",
+        properties: { with_agent: { type: "string" } },
+        required: ["with_agent"],
+      },
+    },
+    // ===== #5 — wake =====
+    {
+      name: "wake_agent",
+      description:
+        "Request a remote wake of an agent (their daemon will spawn a Claude session if installed).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          agent: { type: "string" },
+          reason: { type: "string" },
+        },
+        required: ["agent"],
+      },
+    },
+    {
+      name: "ack_wake",
+      description:
+        "Acknowledge or complete a wake-request you (the woken agent) received. Used by the daemon.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          request_id: { type: "string" },
+          status: {
+            type: "string",
+            enum: ["acknowledged", "completed", "failed"],
+          },
+          error: { type: "string" },
+        },
+        required: ["request_id", "status"],
+      },
+    },
+    // ===== #6, #11 — tasks =====
+    {
+      name: "tasks_list",
+      description:
+        "List your tasks. Optionally filter by status: open|in_progress|done|cancelled.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          status: { type: "string" },
+          limit: { type: "number", default: 50 },
+        },
+      },
+    },
+    {
+      name: "tasks_create",
+      description:
+        "Create a task for yourself or for another agent (agent_name).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          body: { type: "string" },
+          priority: { type: "number", default: 0 },
+          due_at: { type: "string", description: "ISO 8601" },
+          agent_name: {
+            type: "string",
+            description: "Recipient agent (default: yourself)",
+          },
+        },
+        required: ["title"],
+      },
+    },
+    {
+      name: "tasks_update",
+      description: "Update a task's title, body, status, priority, or due date.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          id: { type: "number" },
+          title: { type: "string" },
+          body: { type: "string" },
+          status: {
+            type: "string",
+            enum: ["open", "in_progress", "done", "cancelled"],
+          },
+          priority: { type: "number" },
+          due_at: { type: "string" },
+        },
+        required: ["id"],
+      },
+    },
+    {
+      name: "tasks_complete",
+      description: "Shortcut: mark a task as done.",
+      inputSchema: {
+        type: "object",
+        properties: { id: { type: "number" } },
+        required: ["id"],
+      },
+    },
+    {
+      name: "tasks_delete",
+      description: "Delete a task you own or created.",
+      inputSchema: {
+        type: "object",
+        properties: { id: { type: "number" } },
+        required: ["id"],
+      },
+    },
   ],
 }));
 
@@ -941,6 +1204,83 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 
+  // ===== V0.2 handlers =====
+  if (name === "list_prompts") {
+    const r = await listMyPrompts();
+    return { content: [{ type: "text", text: JSON.stringify((r as any).prompts, null, 2) }] };
+  }
+  if (name === "set_global_prompt") {
+    const r = await setGlobalPrompt({
+      system_prompt: args?.system_prompt as string | undefined,
+      persona: args?.persona as string | undefined,
+    });
+    return { content: [{ type: "text", text: `✓ Global prompt updated\n${JSON.stringify(r, null, 2)}` }] };
+  }
+  if (name === "set_chat_prompt") {
+    const r = await setChatPrompt(args!.with_agent as string, {
+      system_prompt: args?.system_prompt as string | undefined,
+      persona: args?.persona as string | undefined,
+    });
+    return { content: [{ type: "text", text: `✓ Chat prompt for @${args!.with_agent} updated\n${JSON.stringify(r, null, 2)}` }] };
+  }
+  if (name === "clear_chat_prompt") {
+    await clearChatPrompt(args!.with_agent as string);
+    return { content: [{ type: "text", text: `✓ Cleared chat prompt for @${args!.with_agent}` }] };
+  }
+  if (name === "get_effective_prompt") {
+    const r = await effectivePrompt(args!.with_agent as string);
+    return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
+  }
+  if (name === "wake_agent") {
+    const r = await wakeAgent(args!.agent as string, args?.reason as string | undefined);
+    return {
+      content: [{
+        type: "text",
+        text: `✓ Wake requested for @${args!.agent}. request_id=${(r as any).request_id} delivered=${(r as any).delivered}`,
+      }],
+    };
+  }
+  if (name === "ack_wake") {
+    await ackWake(
+      args!.request_id as string,
+      args!.status as "acknowledged" | "completed" | "failed",
+      args?.error as string | undefined,
+    );
+    return { content: [{ type: "text", text: `✓ Wake ${args!.request_id} → ${args!.status}` }] };
+  }
+  if (name === "tasks_list") {
+    const r = await listTasks(args?.status as string | undefined, (args?.limit as number) || 50);
+    return { content: [{ type: "text", text: JSON.stringify((r as any).tasks, null, 2) }] };
+  }
+  if (name === "tasks_create") {
+    const r = await createTask({
+      title: args!.title as string,
+      body: args?.body as string | undefined,
+      priority: (args?.priority as number) ?? 0,
+      due_at: args?.due_at as string | undefined,
+      agent_name: args?.agent_name as string | undefined,
+    });
+    return { content: [{ type: "text", text: `✓ Task #${(r as any).id} created\n${JSON.stringify(r, null, 2)}` }] };
+  }
+  if (name === "tasks_update") {
+    const id = args!.id as number;
+    const payload: any = {};
+    for (const k of ["title", "body", "status", "priority", "due_at"]) {
+      if (args?.[k] !== undefined) payload[k] = args[k];
+    }
+    const r = await updateTask(id, payload);
+    return { content: [{ type: "text", text: `✓ Task #${id} updated\n${JSON.stringify(r, null, 2)}` }] };
+  }
+  if (name === "tasks_complete") {
+    const id = args!.id as number;
+    const r = await updateTask(id, { status: "done" });
+    return { content: [{ type: "text", text: `✓ Task #${id} done` }] };
+  }
+  if (name === "tasks_delete") {
+    await deleteTask(args!.id as number);
+    return { content: [{ type: "text", text: `✓ Task #${args!.id} deleted` }] };
+  }
+
   throw new Error(`Unknown tool: ${name}`);
 });
 
@@ -959,6 +1299,12 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => ({
       uri: "inbetween://profile",
       name: "My InBetween Profile",
       description: `Profile of @${AGENT_NAME} — agent name + pending message count`,
+      mimeType: "application/json",
+    },
+    {
+      uri: "inbetween://tasks",
+      name: "AgentGram Tasks",
+      description: `Open and in-progress tasks for @${AGENT_NAME}.`,
       mimeType: "application/json",
     },
   ],
@@ -1056,6 +1402,21 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
           ),
         },
       ],
+    };
+  }
+
+  if (uri === "inbetween://tasks") {
+    const open = await listTasks("open").catch(() => ({ tasks: [] }));
+    const inProgress = await listTasks("in_progress").catch(() => ({ tasks: [] }));
+    return {
+      contents: [{
+        uri,
+        mimeType: "application/json",
+        text: JSON.stringify({
+          open: (open as any).tasks,
+          in_progress: (inProgress as any).tasks,
+        }, null, 2),
+      }],
     };
   }
 
