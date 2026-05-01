@@ -61,8 +61,19 @@ const WS_URL =
   process.env.INBETWEEN_WS_URL ||
   process.env.AGENTGRAM_WS_URL ||
   config.ws_url;
-const AUTH_TOKEN = config.auth_token;
-const AGENT_NAME = config.agent_name;
+// auth_token может быть либо обычный agent_token (привязан к одному агенту,
+// старый flow), либо owner_token (префикс `own_`, новый flow): один MCP может
+// становиться любым агентом owner'а через become_agent тул.
+const INITIAL_TOKEN = config.auth_token;
+const IS_OWNER_MODE = typeof INITIAL_TOKEN === "string" && INITIAL_TOKEN.startsWith("own_");
+
+// Active session state — меняется при become_agent / logout.
+let activeAgentToken: string | null = IS_OWNER_MODE ? null : INITIAL_TOKEN;
+let activeAgentName: string | null = IS_OWNER_MODE ? null : (config.agent_name || null);
+let activeAgentId: number | null = null;
+
+const AUTH_TOKEN = INITIAL_TOKEN;          // legacy alias for places that still read it
+const AGENT_NAME = config.agent_name || "owner-mode";
 
 // =================================================================
 // LOCAL INBOX (in-memory cache)
@@ -87,11 +98,19 @@ let reconnectTimer: NodeJS.Timeout | null = null;
 let messageNotifier: ((msg: Message) => void) | null = null;
 
 function connectWebSocket(): void {
+  // Owner-mode без активного агента — WS не открываем (нет идентичности для
+  // приёма real-time сообщений). После become_agent эта функция вызывается заново.
+  if (!activeAgentToken) {
+    if (IS_OWNER_MODE) {
+      console.error("[inbetween] owner-mode idle — WS skipped (call become_agent)");
+    }
+    return;
+  }
   // Передаём токен через `Authorization` header — не светится в proxy-логах
   // (старый query-param путь backend держит для обратной совместимости).
   ws = new WebSocket(WS_URL, {
     headers: {
-      Authorization: `Bearer ${AUTH_TOKEN}`,
+      Authorization: `Bearer ${activeAgentToken}`,
     },
   });
 
@@ -298,9 +317,85 @@ async function pollInbox(): Promise<void> {
   }
 }
 
+let pollingStarted = false;
 function startPolling(): void {
-  // Polling каждые 8 сек как fallback к WebSocket
+  if (pollingStarted) return;
+  pollingStarted = true;
   setInterval(pollInbox, 8000);
+}
+
+// =================================================================
+// IDENTITY SWITCHING (owner-mode runtime)
+// =================================================================
+// become_agent / logout / whoami — позволяют одному MCP-процессу
+// представлять любого агента owner'а в течение рантайма. Owner-token из
+// config.json обменивается на agent_token каждый раз.
+
+async function exchangeForAgentToken(agent_id: number): Promise<any> {
+  // Используем INITIAL_TOKEN явно (это owner_token), без активного агента
+  // фолбэка — потому что мы как раз переключаем активного.
+  return api("POST", "/auth/act-as", { agent_id }, { tokenOverride: INITIAL_TOKEN });
+}
+
+async function listMyAgentsViaOwner(): Promise<any> {
+  return api("GET", "/auth/my-agents", undefined, { tokenOverride: INITIAL_TOKEN });
+}
+
+async function becomeAgent(target: { agent_id?: number; name?: string }): Promise<any> {
+  if (!IS_OWNER_MODE) {
+    throw new Error("become_agent requires owner-mode (config has agent_token, not owner_token)");
+  }
+  let id = target.agent_id;
+  if (id == null && target.name) {
+    const list: any = await listMyAgentsViaOwner();
+    const found = (list.agents || []).find((a: any) => a.name === target.name);
+    if (!found) throw new Error(`No agent named @${target.name} owned by you`);
+    id = found.id;
+  }
+  if (id == null) throw new Error("Need agent_id or name");
+
+  const profile: any = await exchangeForAgentToken(id);
+
+  // Drop old WS if any.
+  try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch (e) {}
+
+  // Drop inbox cache (it was for the previous agent).
+  inbox.length = 0;
+
+  activeAgentToken = profile.auth_token;
+  activeAgentName  = profile.name;
+  activeAgentId    = profile.agent_id;
+
+  console.error(`[inbetween] become_agent → @${profile.name} (id=${profile.agent_id})`);
+
+  // Re-open WS + ensure polling is running.
+  connectWebSocket();
+  startPolling();
+
+  // Return agent profile so the LLM sees who it now is.
+  return {
+    agent_id: profile.agent_id,
+    name: profile.name,
+    display_name: profile.display_name,
+    description: profile.description,
+    specialization: profile.specialization,
+    only_human: profile.only_human,
+    tasks_enabled: profile.tasks_enabled,
+    work_dir: profile.work_dir,
+  };
+}
+
+function logoutAgent(): void {
+  try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch (e) {}
+  inbox.length = 0;
+  if (IS_OWNER_MODE) {
+    console.error(`[inbetween] logout: @${activeAgentName || "?"} → idle (owner-mode)`);
+    activeAgentToken = null;
+    activeAgentName = null;
+    activeAgentId = null;
+  } else {
+    console.error("[inbetween] logout ignored — not in owner-mode");
+  }
 }
 
 // =================================================================
@@ -309,13 +404,26 @@ function startPolling(): void {
 async function api<T = any>(
   method: string,
   path: string,
-  body?: any
+  body?: any,
+  opts?: { tokenOverride?: string }
 ): Promise<T> {
+  // Token resolution order:
+  //   1. opts.tokenOverride (для становления агентом — owner_token).
+  //   2. activeAgentToken (after become_agent).
+  //   3. INITIAL_TOKEN (legacy single-agent mode).
+  // Owner-mode без активного агента → большинство тулов кидают ошибку
+  // "no active agent" чтобы LLM позвал become_agent сначала.
+  const tok = opts?.tokenOverride || activeAgentToken || INITIAL_TOKEN;
+  if (IS_OWNER_MODE && !opts?.tokenOverride && !activeAgentToken) {
+    throw new Error(
+      "Not logged in as any agent. Call `become_agent` with an agent_id first."
+    );
+  }
   const res = await fetch(`${BACKEND_URL}${path}`, {
     method,
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${AUTH_TOKEN}`,
+      Authorization: `Bearer ${tok}`,
     },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -525,6 +633,37 @@ const server = new Server(
 // === TOOLS ===
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
+    // ===== Identity (owner-mode) =====
+    {
+      name: "become_agent",
+      description:
+        "Switch this MCP session to act as one of the owner's agents. After calling, all other tools (send_message, get_inbox, chat_messages, etc.) act as that agent. Required first call when this MCP starts in owner-mode (config has owner_token instead of agent_token). Pass either agent_id (numeric) or name (string).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          agent_id: { type: "number", description: "Numeric agent id" },
+          name: { type: "string", description: "Agent name (e.g. 'design')" },
+        },
+      },
+    },
+    {
+      name: "whoami",
+      description:
+        "Show who this MCP session is currently logged in as. Returns the active agent (after become_agent) or `idle` if owner-mode hasn't picked one yet.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "logout",
+      description:
+        "Drop the active agent identity in owner-mode and return to idle. After this you must call become_agent again before using other tools.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "list_my_agents",
+      description:
+        "List agents this owner controls. In owner-mode lists everyone you own (including ephemeral). Useful before become_agent to see the available ids.",
+      inputSchema: { type: "object", properties: {} },
+    },
     {
       name: "send_message",
       description:
@@ -1070,6 +1209,48 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+
+  // ===== Identity =====
+  if (name === "become_agent") {
+    const profile = await becomeAgent({
+      agent_id: args?.agent_id as number | undefined,
+      name: args?.name as string | undefined,
+    });
+    return {
+      content: [{
+        type: "text",
+        text: `✓ Now acting as @${profile.name} (id=${profile.agent_id}).\n\n${JSON.stringify(profile, null, 2)}`,
+      }],
+    };
+  }
+  if (name === "whoami") {
+    const state = activeAgentToken
+      ? {
+          status: "active",
+          agent_id: activeAgentId,
+          name: activeAgentName,
+          mode: IS_OWNER_MODE ? "owner" : "single-agent",
+        }
+      : {
+          status: "idle",
+          mode: IS_OWNER_MODE ? "owner" : "single-agent",
+          note: IS_OWNER_MODE ? "Call become_agent(id) to start acting as one of your agents." : "single-agent mode but no active token (unexpected)",
+        };
+    return { content: [{ type: "text", text: JSON.stringify(state, null, 2) }] };
+  }
+  if (name === "logout") {
+    logoutAgent();
+    return { content: [{ type: "text", text: "✓ Logged out. Call become_agent to act as a different agent." }] };
+  }
+  if (name === "list_my_agents") {
+    if (IS_OWNER_MODE) {
+      const r: any = await listMyAgentsViaOwner();
+      return { content: [{ type: "text", text: JSON.stringify(r.agents, null, 2) }] };
+    }
+    return {
+      content: [{ type: "text", text: "single-agent mode — list_my_agents not applicable. You are @" + AGENT_NAME }],
+    };
+  }
 
   if (name === "send_message") {
     const result: any = await sendMessage(
@@ -1682,6 +1863,10 @@ async function main() {
   const startNetwork = () => {
     if (networkStarted) return;
     networkStarted = true;
+    if (IS_OWNER_MODE && !activeAgentToken) {
+      console.error("[inbetween] MCP initialized — owner-mode idle (call become_agent)");
+      return;
+    }
     console.error("[inbetween] MCP initialized — connecting WS + polling");
     startPolling();
     connectWebSocket();
