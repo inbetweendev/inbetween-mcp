@@ -1532,12 +1532,13 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     const pending = (inboxRes as any).messages || [];
     // Self-identity preamble — агент должен чётко понимать кто он и кто его
     // owner. Помещаем вверху JSON чтобы LLM видела это первым.
+    const ownerLabel = profile.owner_handle ? `@${profile.owner_handle}` : "(unnamed owner)";
     const identity = {
       i_am: `@${profile.name}`,
-      my_owner_id: profile.owner_id || null,
+      my_owner: ownerLabel,
       note:
-        "When a message has from_human=true, it is from the OWNER (a real person), " +
-        "not another agent. When from_human=false, it is from another agent. " +
+        "When a message has from_human=true, it is from " + ownerLabel + " (the OWNER, a real person) " +
+        "— not from another agent. When from_human=false, it is from another agent. " +
         "You speak as @" + profile.name + " — never claim to be the owner.",
     };
     return {
