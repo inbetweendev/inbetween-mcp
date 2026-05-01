@@ -474,6 +474,17 @@ async function searchMessages(opts: {
   if (opts.chat_id) qs.set("chat_id", opts.chat_id);
   return api("GET", `/messages/search?${qs.toString()}`);
 }
+async function getChat(chat_id: string) {
+  return api("GET", `/chats/${encodeURIComponent(chat_id)}`);
+}
+async function setChatSettings(opts: {
+  chat_id: string; notify_mode?: "always" | "on_mention" | "never"; chat_prompt?: string;
+}) {
+  const body: any = {};
+  if (opts.notify_mode !== undefined) body.notify_mode = opts.notify_mode;
+  if (opts.chat_prompt !== undefined) body.chat_prompt = opts.chat_prompt;
+  return api("PATCH", `/chats/${encodeURIComponent(opts.chat_id)}/membership`, body);
+}
 async function inboxUnread(opts: { limit?: number; since?: string } = {}) {
   const qs = new URLSearchParams();
   if (opts.limit != null) qs.set("limit", String(opts.limit));
@@ -1005,6 +1016,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "get_chat",
+      description:
+        "Get chat metadata + my per-member settings (notify_mode, chat_prompt) and member list.",
+      inputSchema: {
+        type: "object",
+        properties: { chat_id: { type: "string" } },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "set_chat_settings",
+      description:
+        "Configure my per-chat settings: notify_mode ('always' | 'on_mention' | 'never') controls when this chat pushes me; chat_prompt is a small persistent rule/role text I'll see every time I read this chat.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string" },
+          notify_mode: {
+            type: "string",
+            enum: ["always", "on_mention", "never"],
+          },
+          chat_prompt: {
+            type: "string",
+            description: "Role + rules visible to me whenever I read this chat. Empty string clears it.",
+          },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
       name: "inbox_unread",
       description:
         "Get all my unread messages across every chat (direct + groups), newest first. Optionally filter by `since` timestamp.",
@@ -1395,7 +1436,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return { content: [{ type: "text", text: JSON.stringify((r as any).chats, null, 2) }] };
   }
   if (name === "chat_messages") {
-    const r = await chatMessages({
+    const r: any = await chatMessages({
       chat_id: args!.chat_id as string,
       limit: args?.limit as number | undefined,
       before: args?.before as string | undefined,
@@ -1404,7 +1445,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       unread: args?.unread as boolean | undefined,
       q: args?.q as string | undefined,
     });
-    return { content: [{ type: "text", text: JSON.stringify((r as any).messages, null, 2) }] };
+    // Prepend chat_prompt so the agent sees role/rules every time it reads
+    // this chat (set via set_chat_settings).
+    const header = r.chat_prompt
+      ? `=== CHAT RULES (chat ${r.chat_id}) ===\n${r.chat_prompt}\n=== END RULES ===\n\n`
+      : "";
+    const body = JSON.stringify(r.messages, null, 2);
+    return { content: [{ type: "text", text: header + body }] };
   }
   if (name === "chat_mark_read") {
     await chatMarkRead(args!.chat_id as string);
@@ -1419,6 +1466,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       chat_id: args?.chat_id as string | undefined,
     });
     return { content: [{ type: "text", text: JSON.stringify((r as any).messages, null, 2) }] };
+  }
+  if (name === "get_chat") {
+    const r = await getChat(args!.chat_id as string);
+    return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
+  }
+  if (name === "set_chat_settings") {
+    await setChatSettings({
+      chat_id: args!.chat_id as string,
+      notify_mode: args?.notify_mode as any,
+      chat_prompt: args?.chat_prompt as string | undefined,
+    });
+    return { content: [{ type: "text", text: `✓ Settings saved for chat ${args!.chat_id}` }] };
   }
   if (name === "inbox_unread") {
     const r = await inboxUnread({
