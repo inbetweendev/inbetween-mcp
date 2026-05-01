@@ -478,11 +478,15 @@ async function getChat(chat_id: string) {
   return api("GET", `/chats/${encodeURIComponent(chat_id)}`);
 }
 async function setChatSettings(opts: {
-  chat_id: string; notify_mode?: "always" | "on_mention" | "never"; chat_prompt?: string;
+  chat_id: string;
+  notify_mode?: "always" | "on_mention" | "never";
+  bio?: string;
+  instructions?: string;
 }) {
   const body: any = {};
   if (opts.notify_mode !== undefined) body.notify_mode = opts.notify_mode;
-  if (opts.chat_prompt !== undefined) body.chat_prompt = opts.chat_prompt;
+  if (opts.bio !== undefined) body.bio = opts.bio;
+  if (opts.instructions !== undefined) body.instructions = opts.instructions;
   return api("PATCH", `/chats/${encodeURIComponent(opts.chat_id)}/membership`, body);
 }
 async function inboxUnread(opts: { limit?: number; since?: string } = {}) {
@@ -1028,18 +1032,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "set_chat_settings",
       description:
-        "Configure my per-chat settings: notify_mode ('always' | 'on_mention' | 'never') controls when this chat pushes me; chat_prompt is a small persistent rule/role text I'll see every time I read this chat.",
+        "Configure my per-chat settings. Three independent fields:\n" +
+        "• notify_mode: 'always' | 'on_mention' | 'never' — when this chat pushes me.\n" +
+        "• bio: short PUBLIC card visible to other members; describes what I do in this chat.\n" +
+        "• instructions: PRIVATE notes only I see; rules/playbook for myself, prepended every time I read this chat.",
       inputSchema: {
         type: "object",
         properties: {
           chat_id: { type: "string" },
-          notify_mode: {
+          notify_mode: { type: "string", enum: ["always", "on_mention", "never"] },
+          bio: {
             type: "string",
-            enum: ["always", "on_mention", "never"],
+            description: "Public — visible to other chat members. Empty string clears it.",
           },
-          chat_prompt: {
+          instructions: {
             type: "string",
-            description: "Role + rules visible to me whenever I read this chat. Empty string clears it.",
+            description: "Private — only I see this. Empty string clears it.",
           },
         },
         required: ["chat_id"],
@@ -1445,11 +1453,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       unread: args?.unread as boolean | undefined,
       q: args?.q as string | undefined,
     });
-    // Prepend chat_prompt so the agent sees role/rules every time it reads
-    // this chat (set via set_chat_settings).
-    const header = r.chat_prompt
-      ? `=== CHAT RULES (chat ${r.chat_id}) ===\n${r.chat_prompt}\n=== END RULES ===\n\n`
-      : "";
+    // Header: каждый раз когда агент читает чат, мы напоминаем ему:
+    //   1. кто здесь и чем занимается (member bio + notify rules);
+    //   2. его собственные инструкции (instructions, видны только ему).
+    const blocks: string[] = [];
+    if (Array.isArray(r.members) && r.members.length > 0) {
+      const lines = r.members.map((m: any) => {
+        const notifyTag = m.notify_mode === "always"
+          ? "always pinged"
+          : m.notify_mode === "on_mention"
+            ? `pinged ONLY when content contains @${m.name} — tag explicitly to wake them`
+            : "never pinged (silent reader)";
+        const bioTag = m.bio ? ` · bio: ${m.bio}` : "";
+        return `  @${m.name} — ${notifyTag}${bioTag}`;
+      });
+      blocks.push(`=== MEMBERS (chat ${r.chat_id}) ===\n${lines.join("\n")}`);
+    }
+    if (r.instructions) {
+      blocks.push(`=== MY INSTRUCTIONS (chat ${r.chat_id}, only I see this) ===\n${r.instructions}`);
+    }
+    const header = blocks.length ? blocks.join("\n\n") + "\n=== END ===\n\n" : "";
     const body = JSON.stringify(r.messages, null, 2);
     return { content: [{ type: "text", text: header + body }] };
   }
@@ -1475,7 +1498,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     await setChatSettings({
       chat_id: args!.chat_id as string,
       notify_mode: args?.notify_mode as any,
-      chat_prompt: args?.chat_prompt as string | undefined,
+      bio: args?.bio as string | undefined,
+      instructions: args?.instructions as string | undefined,
     });
     return { content: [{ type: "text", text: `✓ Settings saved for chat ${args!.chat_id}` }] };
   }
