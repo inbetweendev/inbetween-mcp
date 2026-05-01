@@ -436,6 +436,50 @@ async function deleteTask(id: number) {
   return api("DELETE", `/tasks/${id}`);
 }
 
+// === Unified chats ===
+async function listChats() {
+  return api("GET", "/chats");
+}
+async function chatMessages(opts: {
+  chat_id: string;
+  limit?: number;
+  before?: string;
+  since?: string;
+  until?: string;
+  unread?: boolean;
+  q?: string;
+}) {
+  const qs = new URLSearchParams();
+  if (opts.limit != null) qs.set("limit", String(opts.limit));
+  if (opts.before) qs.set("before", opts.before);
+  if (opts.since) qs.set("since", opts.since);
+  if (opts.until) qs.set("until", opts.until);
+  if (opts.unread) qs.set("unread", "true");
+  if (opts.q) qs.set("q", opts.q);
+  const path = `/chats/${encodeURIComponent(opts.chat_id)}/messages?${qs.toString()}`;
+  return api("GET", path);
+}
+async function chatMarkRead(chat_id: string) {
+  return api("POST", `/chats/${encodeURIComponent(chat_id)}/read`);
+}
+async function searchMessages(opts: {
+  q: string; limit?: number; since?: string; until?: string; chat_id?: string;
+}) {
+  const qs = new URLSearchParams({ q: opts.q });
+  if (opts.limit != null) qs.set("limit", String(opts.limit));
+  if (opts.since) qs.set("since", opts.since);
+  if (opts.until) qs.set("until", opts.until);
+  if (opts.chat_id) qs.set("chat_id", opts.chat_id);
+  return api("GET", `/messages/search?${qs.toString()}`);
+}
+async function inboxUnread(opts: { limit?: number; since?: string } = {}) {
+  const qs = new URLSearchParams();
+  if (opts.limit != null) qs.set("limit", String(opts.limit));
+  if (opts.since) qs.set("since", opts.since);
+  const path = `/inbox/unread${qs.toString() ? "?" + qs.toString() : ""}`;
+  return api("GET", path);
+}
+
 // =================================================================
 // MCP SERVER SETUP
 // =================================================================
@@ -908,6 +952,68 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["id"],
       },
     },
+    // ===== Unified chats =====
+    {
+      name: "list_chats",
+      description:
+        "List all your chats (direct + groups) with last message, unread count, and other-side online status. Sorted by recency.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "chat_messages",
+      description:
+        "Get messages from a specific chat with optional filters: limit, before (cursor), since/until (ISO timestamps), unread (only my unread), q (full-text search).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "Chat id from list_chats (number for direct, 'group:<uuid>' for legacy group)" },
+          limit: { type: "number", default: 50 },
+          before: { type: "string", description: "message_id cursor — returns messages older than this one" },
+          since: { type: "string", description: "ISO 8601 — only messages at or after" },
+          until: { type: "string", description: "ISO 8601 — only messages strictly before" },
+          unread: { type: "boolean", description: "Only my unread messages", default: false },
+          q: { type: "string", description: "Full-text search query (websearch syntax: phrases, OR, minus)" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "chat_mark_read",
+      description: "Mark an entire chat as read up to now (moves your last_read_at cursor).",
+      inputSchema: {
+        type: "object",
+        properties: { chat_id: { type: "string" } },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "search_messages",
+      description:
+        "Full-text search across all messages you have access to. Supports websearch syntax: \"exact phrase\", word OR word, -excluded. Returns highlighted snippets.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          q: { type: "string" },
+          limit: { type: "number", default: 50 },
+          since: { type: "string" },
+          until: { type: "string" },
+          chat_id: { type: "string", description: "Restrict search to a specific chat" },
+        },
+        required: ["q"],
+      },
+    },
+    {
+      name: "inbox_unread",
+      description:
+        "Get all my unread messages across every chat (direct + groups), newest first. Optionally filter by `since` timestamp.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: { type: "number", default: 50 },
+          since: { type: "string", description: "ISO 8601 — only unread at or after" },
+        },
+      },
+    },
   ],
 }));
 
@@ -1279,6 +1385,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "tasks_delete") {
     await deleteTask(args!.id as number);
     return { content: [{ type: "text", text: `✓ Task #${args!.id} deleted` }] };
+  }
+
+  // ===== Unified chats =====
+  if (name === "list_chats") {
+    const r = await listChats();
+    return { content: [{ type: "text", text: JSON.stringify((r as any).chats, null, 2) }] };
+  }
+  if (name === "chat_messages") {
+    const r = await chatMessages({
+      chat_id: args!.chat_id as string,
+      limit: args?.limit as number | undefined,
+      before: args?.before as string | undefined,
+      since: args?.since as string | undefined,
+      until: args?.until as string | undefined,
+      unread: args?.unread as boolean | undefined,
+      q: args?.q as string | undefined,
+    });
+    return { content: [{ type: "text", text: JSON.stringify((r as any).messages, null, 2) }] };
+  }
+  if (name === "chat_mark_read") {
+    await chatMarkRead(args!.chat_id as string);
+    return { content: [{ type: "text", text: `✓ Chat ${args!.chat_id} marked read` }] };
+  }
+  if (name === "search_messages") {
+    const r = await searchMessages({
+      q: args!.q as string,
+      limit: args?.limit as number | undefined,
+      since: args?.since as string | undefined,
+      until: args?.until as string | undefined,
+      chat_id: args?.chat_id as string | undefined,
+    });
+    return { content: [{ type: "text", text: JSON.stringify((r as any).messages, null, 2) }] };
+  }
+  if (name === "inbox_unread") {
+    const r = await inboxUnread({
+      limit: args?.limit as number | undefined,
+      since: args?.since as string | undefined,
+    });
+    return { content: [{ type: "text", text: JSON.stringify((r as any).messages, null, 2) }] };
   }
 
   throw new Error(`Unknown tool: ${name}`);
