@@ -117,15 +117,16 @@ function connectWebSocket(): void {
           metadata: { ...(event.metadata || {}), from_human: !!event.from_human },
           sent_at: event.sent_at,
         };
+        // Dedup: если сообщение уже в кеше — это duplicate из polling
+        // fallback, заглушаем повторное уведомление.
         if (!inbox.find((m) => m.message_id === msg.message_id)) {
           inbox.unshift(msg);
           if (inbox.length > MAX_INBOX_SIZE) inbox.pop();
+          notifyClaudeAboutMessage(msg);
         }
-        notifyClaudeAboutMessage(msg);
       } else if (event.type === "new_messages_batch") {
-        // Debounced batch (#2): несколько сообщений объединены сервером —
-        // нотифицируем юзера одним аккумулированным сообщением.
         const items: any[] = event.messages || [];
+        const fresh: any[] = [];
         for (const m of items) {
           const msg: Message = {
             message_id: m.message_id,
@@ -138,9 +139,10 @@ function connectWebSocket(): void {
           if (!inbox.find((x) => x.message_id === msg.message_id)) {
             inbox.unshift(msg);
             if (inbox.length > MAX_INBOX_SIZE) inbox.pop();
+            fresh.push(m);
           }
         }
-        notifyClaudeAboutBatch(items);
+        if (fresh.length > 0) notifyClaudeAboutBatch(fresh);
       } else if (event.type === "wake") {
         notifyClaudeAboutWake(event);
       } else if (event.type === "task_created") {
@@ -1521,12 +1523,23 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   }
 
   if (uri === "inbetween://profile") {
-    const [profileRes, inboxRes] = await Promise.all([
-      fetch(`${BACKEND_URL}/agents/${AGENT_NAME}`),
+    // /agents/whoami даёт полный self-профиль (с owner_id, флагами).
+    const [whoamiRes, inboxRes] = await Promise.all([
+      api<any>("GET", "/agents/whoami").catch(() => null),
       fetchInbox(true).catch(() => ({ messages: [] })),
     ]);
-    const profile = await profileRes.json();
+    const profile = whoamiRes || { name: AGENT_NAME };
     const pending = (inboxRes as any).messages || [];
+    // Self-identity preamble — агент должен чётко понимать кто он и кто его
+    // owner. Помещаем вверху JSON чтобы LLM видела это первым.
+    const identity = {
+      i_am: `@${profile.name}`,
+      my_owner_id: profile.owner_id || null,
+      note:
+        "When a message has from_human=true, it is from the OWNER (a real person), " +
+        "not another agent. When from_human=false, it is from another agent. " +
+        "You speak as @" + profile.name + " — never claim to be the owner.",
+    };
     return {
       contents: [
         {
@@ -1534,10 +1547,12 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
           mimeType: "application/json",
           text: JSON.stringify(
             {
+              identity,
               ...profile,
               pending_messages_count: pending.length,
               pending_preview: pending.slice(0, 3).map((m: any) => ({
                 from: m.from_agent,
+                from_human: !!(m.metadata && (m.metadata as any).from_human),
                 preview: (m.content || "").slice(0, 100),
                 sent_at: m.sent_at,
               })),
