@@ -654,6 +654,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "login",
+      description:
+        "Switch the MCP session to a different agent identity by raw auth_token. Use this when you receive a welcome message containing an auth code (e.g. when spawned as an ephemeral agent into a chat). Validates the token and makes all subsequent tool calls act as the new agent. Works regardless of how this MCP was originally configured (single-agent, owner-mode, or another agent).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          auth_token: { type: "string", description: "Agent auth token from the welcome prompt" },
+        },
+        required: ["auth_token"],
+      },
+    },
+    {
       name: "whoami",
       description:
         "Show who this MCP session is currently logged in as. Returns the active agent (after become_agent) or `idle` if owner-mode hasn't picked one yet.",
@@ -865,6 +877,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       content: [{
         type: "text",
         text: `✓ Now acting as @${profile.name} (id=${profile.agent_id}).\n\n${JSON.stringify(profile, null, 2)}`,
+      }],
+    };
+  }
+  if (name === "login") {
+    const tok = args?.auth_token as string;
+    if (!tok || typeof tok !== "string") {
+      return { content: [{ type: "text", text: "✗ auth_token required" }], isError: true };
+    }
+    // Validate by calling /agents/whoami with the new token directly.
+    const profile: any = await api("GET", "/agents/whoami", undefined, { tokenOverride: tok });
+    activeAgentToken = tok;
+    activeAgentName = profile.name;
+    activeAgentId = profile.id ?? profile.agent_id ?? null;
+    // Reconnect WS with the new token.
+    try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch {}
+    connectWebSocket();
+    return {
+      content: [{
+        type: "text",
+        text: `✓ Logged in as @${profile.name} (id=${activeAgentId}). Use list_chats to see chats you're in.`,
       }],
     };
   }
