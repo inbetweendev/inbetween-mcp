@@ -14,9 +14,10 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import WebSocket from "ws";
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+import { createHash } from "crypto";
 
 // =================================================================
 // CONFIG
@@ -67,10 +68,43 @@ const WS_URL =
 const INITIAL_TOKEN = config.auth_token;
 const IS_OWNER_MODE = typeof INITIAL_TOKEN === "string" && INITIAL_TOKEN.startsWith("own_");
 
-// Active session state — меняется при become_agent / logout.
-let activeAgentToken: string | null = IS_OWNER_MODE ? null : INITIAL_TOKEN;
-let activeAgentName: string | null = IS_OWNER_MODE ? null : (config.agent_name || null);
-let activeAgentId: number | null = null;
+// Per-cwd session persistence: каждый Claude Code в своей папке хранит свою
+// последнюю activeAgentToken. При restart MCP в той же папке — сессия восстановится.
+const SESSION_DIR = join(homedir(), ".inbetween", "sessions");
+const cwdHash = createHash("sha256").update(process.cwd()).digest("hex").slice(0, 16);
+const SESSION_FILE = join(SESSION_DIR, `${cwdHash}.json`);
+function loadSession(): { token: string; name: string; id: number | null } | null {
+  try {
+    if (!existsSync(SESSION_FILE)) return null;
+    return JSON.parse(readFileSync(SESSION_FILE, "utf-8"));
+  } catch (e) {
+    console.error(`[inbetween] session load failed: ${e}`);
+    return null;
+  }
+}
+function saveSession(token: string, name: string, id: number | null) {
+  try {
+    mkdirSync(SESSION_DIR, { recursive: true });
+    writeFileSync(SESSION_FILE, JSON.stringify({ token, name, id, cwd: process.cwd(), saved_at: new Date().toISOString() }, null, 2));
+    console.error(`[inbetween] session saved → ${SESSION_FILE} (${name}/${id})`);
+  } catch (e) {
+    console.error(`[inbetween] session save failed: ${e}`);
+  }
+}
+function clearSession() {
+  try { if (existsSync(SESSION_FILE)) writeFileSync(SESSION_FILE, "{}"); } catch {}
+}
+
+// Active session state — меняется при login / become_agent / logout.
+const persisted = loadSession();
+let activeAgentToken: string | null = persisted?.token
+  ?? (IS_OWNER_MODE ? null : INITIAL_TOKEN);
+let activeAgentName: string | null = persisted?.name
+  ?? (IS_OWNER_MODE ? null : (config.agent_name || null));
+let activeAgentId: number | null = persisted?.id ?? null;
+if (persisted) {
+  console.error(`[inbetween] restored session for cwd=${process.cwd()} → @${activeAgentName} (id=${activeAgentId})`);
+}
 
 const AUTH_TOKEN = INITIAL_TOKEN;          // legacy alias for places that still read it
 const AGENT_NAME = config.agent_name || "owner-mode";
@@ -115,8 +149,7 @@ function connectWebSocket(): void {
   });
 
   ws.on("open", () => {
-    console.error(`[inbetween] Connected as @${AGENT_NAME}`);
-    // Heartbeat
+    console.error(`[inbetween] WS OPEN as @${activeAgentName || AGENT_NAME} (id=${activeAgentId}) → ${WS_URL}`);
     setInterval(() => {
       if (ws?.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "heartbeat" }));
@@ -127,6 +160,9 @@ function connectWebSocket(): void {
   ws.on("message", (data) => {
     try {
       const event = JSON.parse(data.toString());
+      if (event.type !== "heartbeat_ack") {
+        console.error(`[inbetween] WS recv type=${event.type} msg_id=${event.message_id || "-"} from=${event.from_agent || "-"}`);
+      }
       if (event.type === "new_message") {
         const msg: Message = {
           message_id: event.message_id,
@@ -174,8 +210,12 @@ function connectWebSocket(): void {
     }
   });
 
-  ws.on("close", () => {
-    console.error("[inbetween] WS disconnected, reconnecting in 3s...");
+  ws.on("close", (code, reason) => {
+    console.error(`[inbetween] WS CLOSE code=${code} reason=${reason?.toString() || "?"}; reconnect in 3s`);
+    if (code === 4002) {
+      console.error("[inbetween] superseded by another login → not reconnecting (this session is stale)");
+      return;
+    }
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connectWebSocket, 3000);
   });
@@ -365,6 +405,7 @@ async function becomeAgent(target: { agent_id?: number; name?: string }): Promis
   activeAgentToken = profile.auth_token;
   activeAgentName  = profile.name;
   activeAgentId    = profile.agent_id;
+  saveSession(profile.auth_token, profile.name, profile.agent_id);
 
   console.error(`[inbetween] become_agent → @${profile.name} (id=${profile.agent_id})`);
 
@@ -388,14 +429,11 @@ async function becomeAgent(target: { agent_id?: number; name?: string }): Promis
 function logoutAgent(): void {
   try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch (e) {}
   inbox.length = 0;
-  if (IS_OWNER_MODE) {
-    console.error(`[inbetween] logout: @${activeAgentName || "?"} → idle (owner-mode)`);
-    activeAgentToken = null;
-    activeAgentName = null;
-    activeAgentId = null;
-  } else {
-    console.error("[inbetween] logout ignored — not in owner-mode");
-  }
+  console.error(`[inbetween] logout: @${activeAgentName || "?"} → idle`);
+  activeAgentToken = null;
+  activeAgentName = null;
+  activeAgentId = null;
+  clearSession();
 }
 
 // =================================================================
@@ -885,18 +923,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (!tok || typeof tok !== "string") {
       return { content: [{ type: "text", text: "✗ auth_token required" }], isError: true };
     }
-    // Validate by calling /agents/whoami with the new token directly.
     const profile: any = await api("GET", "/agents/whoami", undefined, { tokenOverride: tok });
     activeAgentToken = tok;
     activeAgentName = profile.name;
     activeAgentId = profile.id ?? profile.agent_id ?? null;
-    // Reconnect WS with the new token.
+    saveSession(tok, profile.name, activeAgentId);
     try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch {}
     connectWebSocket();
     return {
       content: [{
         type: "text",
-        text: `✓ Logged in as @${profile.name} (id=${activeAgentId}). Use list_chats to see chats you're in.`,
+        text: `✓ Logged in as @${profile.name} (id=${activeAgentId}). Session persisted for this folder. Use list_chats to see chats you're in.`,
       }],
     };
   }
