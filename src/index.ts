@@ -140,6 +140,15 @@ function connectWebSocket(): void {
     }
     return;
   }
+  // Wrapper-mode (e.g. inside `inbetween-codex`): the wrapper itself owns the
+  // backend WS and injects messages into the host TUI directly. The MCP server
+  // only serves outgoing tool calls — no WS, no inbox push. Set by the
+  // installer in --codex mode so MCP doesn't fight the wrapper for the
+  // single-session WS slot.
+  if (process.env.INBETWEEN_DISABLE_WS === "1") {
+    console.error("[inbetween] WS disabled (INBETWEEN_DISABLE_WS=1) — tool-only mode");
+    return;
+  }
   // Передаём токен через `Authorization` header — не светится в proxy-логах
   // (старый query-param путь backend держит для обратной совместимости).
   ws = new WebSocket(WS_URL, {
