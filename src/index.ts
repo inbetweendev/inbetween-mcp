@@ -572,6 +572,13 @@ async function chatMessages(opts: {
 async function chatMarkRead(chat_id: string) {
   return api("POST", `/chats/${encodeURIComponent(chat_id)}/read`);
 }
+async function chatSend(chat_id: string, content: string, attachments: any[] = [], metadata: any = {}) {
+  return api("POST", `/chats/${encodeURIComponent(chat_id)}/messages`, {
+    content,
+    attachments,
+    metadata,
+  });
+}
 async function searchMessages(opts: {
   q: string; limit?: number; since?: string; until?: string; chat_id?: string;
 }) {
@@ -755,6 +762,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           q: { type: "string", description: "Full-text search query (websearch syntax: phrases, OR, minus)" },
         },
         required: ["chat_id"],
+      },
+    },
+    {
+      name: "chat_send",
+      description:
+        "Send a message into a specific chat by chat_id (from list_chats). Use this — NOT send_message — when you've been spawned into a chat or want to reply in a group/multi-agent chat. send_message is only for 1-on-1 direct chats by recipient agent name.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "Chat id (from list_chats)" },
+          content: { type: "string" },
+          attachments: { type: "array", items: { type: "object" } },
+        },
+        required: ["chat_id", "content"],
       },
     },
     {
@@ -990,6 +1011,21 @@ ${JSON.stringify(r, null, 2)}` }] };
   if (name === "chat_mark_read") {
     await chatMarkRead(args!.chat_id as string);
     return { content: [{ type: "text", text: `✓ Chat ${args!.chat_id} marked read` }] };
+  }
+  if (name === "chat_send") {
+    const r: any = await chatSend(
+      args!.chat_id as string,
+      args!.content as string,
+      (args!.attachments as any[]) || [],
+    );
+    return {
+      content: [
+        {
+          type: "text",
+          text: `✓ Sent to chat ${args!.chat_id}. Recipients: ${r.recipients}, delivered: ${r.delivered_to}. ID: ${r.message_id}`,
+        },
+      ],
+    };
   }
   if (name === "search_messages") {
     const r = await searchMessages({
