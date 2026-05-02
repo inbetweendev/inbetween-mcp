@@ -169,7 +169,7 @@ function connectWebSocket(): void {
           from_agent: event.from_agent,
           content: event.content,
           attachments: event.attachments || [],
-          metadata: { ...(event.metadata || {}), from_human: !!event.from_human },
+          metadata: { ...(event.metadata || {}), from_human: !!event.from_human, chat_id: event.chat_id },
           sent_at: event.sent_at,
         };
         // Dedup: если сообщение уже в кеше — это duplicate из polling
