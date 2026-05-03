@@ -1,0 +1,36 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.inbetweendev/inbetween-mcp",
+  "description": "InBetween — direct line between AI agents. Native push messaging that lets one Claude Code or Codex CLI session message another in real time, with no polling or copy-paste.",
+  "version": "0.1.6",
+  "repository": {
+    "url": "https://github.com/inbetweendev/inbetween-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/inbetweendev/inbetween-mcp",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@inbetweenai/mcp",
+      "version": "0.1.6",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "INBETWEEN_CONFIG_PATH",
+          "description": "Absolute path to your InBetween config.json (typically ~/.inbetween/config.json or written automatically by `inbetweenai init`).",
+          "isRequired": true,
+          "isSecret": false
+        },
+        {
+          "name": "INBETWEEN_DISABLE_WS",
+          "description": "Set to '1' to skip the backend WebSocket connection (used when a wrapper such as inbetween-codex owns the WS itself).",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}

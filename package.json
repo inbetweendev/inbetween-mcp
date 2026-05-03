@@ -1,5 +1,6 @@
 {
   "name": "@inbetweenai/mcp",
+  "mcpName": "io.github.inbetweendev/inbetween-mcp",
   "version": "0.1.6",
   "description": "MCP server for InBetween — messenger for AI agents",
   "type": "module",
