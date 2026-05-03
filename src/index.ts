@@ -68,32 +68,77 @@ const WS_URL =
 const INITIAL_TOKEN = config.auth_token;
 const IS_OWNER_MODE = typeof INITIAL_TOKEN === "string" && INITIAL_TOKEN.startsWith("own_");
 
-// Per-cwd session persistence: каждый Claude Code в своей папке хранит свою
-// последнюю activeAgentToken. При restart MCP в той же папке — сессия восстановится.
+// Per-process session persistence (multi-window-safe).
+//
+// Two files per cwd:
+//   <cwd-hash>.json              — "default" identity for this folder. Read on
+//                                  fresh MCP boot so a single-window flow keeps
+//                                  the same agent across restarts.
+//   <cwd-hash>__<pid>.json       — per-process override. Wins over the default
+//                                  when present so multiple Claude Code windows
+//                                  in the same folder don't clobber each
+//                                  other's identity.
+//
+// Anchor for "this process" can be supplied externally via env vars (Claude
+// Code passes a session id we honour first; otherwise we use the MCP server's
+// own pid). The pid file is removed on a clean exit so it doesn't pile up.
 const SESSION_DIR = join(homedir(), ".inbetween", "sessions");
 const cwdHash = createHash("sha256").update(process.cwd()).digest("hex").slice(0, 16);
-const SESSION_FILE = join(SESSION_DIR, `${cwdHash}.json`);
+const PROCESS_KEY = (
+  process.env.MCP_SESSION_ID ||
+  process.env.MCP_CLAUDE_SESSION_ID ||
+  String(process.pid)
+).slice(0, 32);
+const SESSION_FILE_DEFAULT = join(SESSION_DIR, `${cwdHash}.json`);
+const SESSION_FILE_PROC = join(SESSION_DIR, `${cwdHash}__${PROCESS_KEY}.json`);
+
 function loadSession(): { token: string; name: string; id: number | null } | null {
-  try {
-    if (!existsSync(SESSION_FILE)) return null;
-    return JSON.parse(readFileSync(SESSION_FILE, "utf-8"));
-  } catch (e) {
-    console.error(`[inbetween] session load failed: ${e}`);
-    return null;
+  // Per-process file wins over the default.
+  for (const path of [SESSION_FILE_PROC, SESSION_FILE_DEFAULT]) {
+    try {
+      if (!existsSync(path)) continue;
+      const raw = readFileSync(path, "utf-8").trim();
+      if (!raw || raw === "{}") continue;
+      return JSON.parse(raw);
+    } catch (e) {
+      console.error(`[inbetween] session load failed (${path}): ${e}`);
+    }
   }
+  return null;
 }
 function saveSession(token: string, name: string, id: number | null) {
+  const payload = JSON.stringify(
+    { token, name, id, cwd: process.cwd(), pid: process.pid, saved_at: new Date().toISOString() },
+    null,
+    2,
+  );
   try {
     mkdirSync(SESSION_DIR, { recursive: true });
-    writeFileSync(SESSION_FILE, JSON.stringify({ token, name, id, cwd: process.cwd(), saved_at: new Date().toISOString() }, null, 2));
-    console.error(`[inbetween] session saved → ${SESSION_FILE} (${name}/${id})`);
+    // Per-process file: this Claude window's current identity. Always wins on
+    // subsequent reads from this same process key.
+    writeFileSync(SESSION_FILE_PROC, payload);
+    // Default file: also updated so a brand-new MCP boot in this folder picks
+    // up the most recent intent. A second concurrent window will create its
+    // own per-process file, overriding this default for itself.
+    writeFileSync(SESSION_FILE_DEFAULT, payload);
+    console.error(`[inbetween] session saved → ${SESSION_FILE_PROC} (${name}/${id})`);
   } catch (e) {
     console.error(`[inbetween] session save failed: ${e}`);
   }
 }
 function clearSession() {
-  try { if (existsSync(SESSION_FILE)) writeFileSync(SESSION_FILE, "{}"); } catch {}
+  for (const path of [SESSION_FILE_PROC, SESSION_FILE_DEFAULT]) {
+    try { if (existsSync(path)) writeFileSync(path, "{}"); } catch {}
+  }
 }
+// Drop the per-process file on a clean exit so we don't accumulate stale
+// state forever. The default file remains so the next boot keeps continuity.
+function cleanupProcessSessionFile() {
+  try { if (existsSync(SESSION_FILE_PROC)) writeFileSync(SESSION_FILE_PROC, "{}"); } catch {}
+}
+process.on("exit", cleanupProcessSessionFile);
+process.on("SIGINT", () => { cleanupProcessSessionFile(); process.exit(0); });
+process.on("SIGTERM", () => { cleanupProcessSessionFile(); process.exit(0); });
 
 // Active session state — меняется при login / become_agent / logout.
 const persisted = loadSession();
