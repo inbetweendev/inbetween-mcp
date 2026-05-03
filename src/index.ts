@@ -817,11 +817,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "tasks_list",
       description:
-        "List your tasks. Optionally filter by status: open|in_progress|done|cancelled.",
+        "List your tasks (where you are owner OR assignee). Optionally filter by status: pending|in_progress|done.",
       inputSchema: {
         type: "object",
         properties: {
-          status: { type: "string" },
+          status: { type: "string", enum: ["pending", "in_progress", "done"] },
           limit: { type: "number", default: 50 },
         },
       },
@@ -829,17 +829,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "tasks_upsert",
       description:
-        "Create or update a task. If `id` is set → update (status changes to 'done' or 'cancelled' substitute for the old `tasks_complete` / `tasks_delete`). If `id` is omitted → create new task.",
+        "Create or update a task. If `id` is set → update (set status='done' to complete; there is no 'cancelled' anymore — use done or delete). If `id` is omitted → create new task (default status='pending').",
       inputSchema: {
         type: "object",
         properties: {
           id: { type: "number", description: "Task id to update; omit to create" },
           title: { type: "string" },
           body: { type: "string" },
-          status: { type: "string", enum: ["open", "in_progress", "done", "cancelled"] },
+          status: { type: "string", enum: ["pending", "in_progress", "done"] },
           priority: { type: "number", default: 0 },
           due_at: { type: "string", description: "ISO 8601" },
-          agent_name: { type: "string", description: "Recipient agent (create only; default: yourself)" },
+          agent_name: { type: "string", description: "Owner agent of the task (create only; default: yourself)" },
+          assignee_agent_id: { type: "number", description: "Explicit executor agent id (optional, can differ from owner)" },
+          chat_id: { type: "number", description: "Attach task to a chat (optional)" },
         },
       },
     },
@@ -1077,7 +1079,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 if (name === "tasks_upsert") {
     const id = args?.id as number | undefined;
     const payload: any = {};
-    for (const k of ["title", "body", "status", "priority", "due_at", "agent_name"]) {
+    for (const k of ["title", "body", "status", "priority", "due_at", "agent_name", "assignee_agent_id", "chat_id"]) {
       if (args?.[k] !== undefined) payload[k] = args[k];
     }
     if (id != null) {
