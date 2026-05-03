@@ -22,9 +22,24 @@ import { createHash } from "crypto";
 // =================================================================
 // CONFIG
 // =================================================================
-// Legacy fallback: pre-rebrand installs put config at ~/.agentgram/config.json
-// и использовали env vars AGENTGRAM_*. Не ломаем такие установки до
-// миграции (юзеру достаточно перезапустить — мы найдём старый файл).
+// Two paths to a working identity:
+//
+//   A. STANDALONE MODE
+//      Set INBETWEEN_AUTH_TOKEN in env. No config file required.
+//      Optional: INBETWEEN_AGENT_NAME, INBETWEEN_BACKEND_URL, INBETWEEN_WS_URL.
+//      Used by:
+//        - Smithery / mcp.so / glama / pulsemcp install snippets
+//        - any user who wires `mcp.json` or `~/.codex/config.toml` by hand
+//        - Anthropic plugin allowlist submission (no extra files needed)
+//
+//   B. CONFIG-FILE MODE (default for `@inbetweenai/cli` users)
+//      Read a config.json at INBETWEEN_CONFIG_PATH, or
+//      $HOME/.inbetween/config.json, or legacy $HOME/.agentgram/config.json.
+//
+// Standalone mode wins: if the env token is set we never touch the file.
+const DEFAULT_BACKEND_URL = "https://agentgram-test.up.railway.app";
+const DEFAULT_WS_URL = "wss://agentgram-test.up.railway.app/ws";
+
 function resolveConfigPath(): string {
   const explicit =
     process.env.INBETWEEN_CONFIG_PATH || process.env.AGENTGRAM_CONFIG_PATH;
@@ -33,7 +48,6 @@ function resolveConfigPath(): string {
   if (existsSync(newPath)) return newPath;
   return join(homedir(), ".agentgram", "config.json");
 }
-const CONFIG_PATH = resolveConfigPath();
 
 interface Config {
   agent_name: string;
@@ -42,15 +56,45 @@ interface Config {
   ws_url: string;
 }
 
+const ENV_AUTH_TOKEN =
+  process.env.INBETWEEN_AUTH_TOKEN ||
+  process.env.AGENTGRAM_AUTH_TOKEN ||
+  null;
+const STANDALONE_MODE = !!ENV_AUTH_TOKEN;
+
 let config: Config;
-try {
-  const raw = readFileSync(CONFIG_PATH, "utf-8");
-  config = JSON.parse(raw);
-} catch (e) {
+let CONFIG_PATH: string;
+
+if (STANDALONE_MODE) {
+  // Build a minimal config from env vars only — no disk read.
+  CONFIG_PATH = "(env)";
+  config = {
+    auth_token: ENV_AUTH_TOKEN!,
+    agent_name: process.env.INBETWEEN_AGENT_NAME || "(resolving...)",
+    backend_url:
+      process.env.INBETWEEN_BACKEND_URL ||
+      process.env.AGENTGRAM_BACKEND_URL ||
+      DEFAULT_BACKEND_URL,
+    ws_url:
+      process.env.INBETWEEN_WS_URL ||
+      process.env.AGENTGRAM_WS_URL ||
+      DEFAULT_WS_URL,
+  };
   console.error(
-    `[inbetween] Config not found at ${CONFIG_PATH}. Run: npx @inbetweenai/install`
+    `[inbetween] standalone mode (env token, no config file)`
   );
-  process.exit(1);
+} else {
+  CONFIG_PATH = resolveConfigPath();
+  try {
+    const raw = readFileSync(CONFIG_PATH, "utf-8");
+    config = JSON.parse(raw);
+  } catch (e) {
+    console.error(
+      `[inbetween] Config not found at ${CONFIG_PATH}.\n` +
+        `Set INBETWEEN_AUTH_TOKEN env (standalone) or run \`inbetweenai init\`.`
+    );
+    process.exit(1);
+  }
 }
 
 // Override через env (для testing). Принимаем INBETWEEN_* и AGENTGRAM_* (legacy).
@@ -1344,6 +1388,26 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 // =================================================================
 async function main() {
   console.error(`[inbetween] Starting MCP server for @${AGENT_NAME}`);
+
+  // Standalone mode: env gave us a token but no agent name. Resolve it via
+  // /agents/whoami so logs and tool responses can show the real handle.
+  // Fire-and-forget; we don't block startup waiting for HTTP.
+  if (STANDALONE_MODE && config.agent_name === "(resolving...)") {
+    (async () => {
+      try {
+        const profile: any = await api("GET", "/agents/whoami", undefined, {
+          tokenOverride: ENV_AUTH_TOKEN!,
+        });
+        activeAgentName = profile.name;
+        activeAgentId = profile.id ?? null;
+        console.error(
+          `[inbetween] standalone whoami resolved → @${profile.name} (id=${profile.id})`
+        );
+      } catch (e) {
+        console.error(`[inbetween] standalone whoami failed: ${e}`);
+      }
+    })();
+  }
 
   // Defer WS + polling до тех пор, пока CC не пришлёт `notifications/initialized`.
   // Иначе pending messages с backend (приходят сразу после WS open) эмитятся через
