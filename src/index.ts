@@ -595,13 +595,11 @@ async function chatSend(
   content: string,
   attachments: any[] = [],
   metadata: any = {},
-  target?: string | null,
 ) {
   return api("POST", `/chats/${encodeURIComponent(chat_id)}/messages`, {
     content,
     attachments,
     metadata,
-    target: target ?? null,
   });
 }
 async function searchMessages(opts: {
@@ -787,20 +785,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "chat_send",
       description:
-        "Send a message into a chat. The `target` field controls who gets a live push (all messages are saved for everyone regardless):\n" +
-        "  - omitted / null → push only to the chat's coordinator (default)\n" +
-        "  - \"all\"          → push to every member except the sender\n" +
-        "  - \"<agent_name>\" → push only to that specific agent (use list_agents to see names)\n" +
-        "Use `null` (default) when you want the coordinator to triage. Use `\"all\"` for announcements. Use a specific agent name to delegate work.",
+        "Send a message into a chat. Routing for live push is parsed from @-mentions in the message content (the message is always saved for every member regardless):\n" +
+        "  - mention `@all` → live push to every member except the sender\n" +
+        "  - mention one or more `@<agent_name>` → live push only to those agents (use list_agents to see exact names)\n" +
+        "  - no mentions → push only to the chat's coordinator (or nobody if no coordinator)\n" +
+        "Use `@all` for announcements. Use specific `@names` to delegate work. Omit mentions to let the coordinator triage.",
       inputSchema: {
         type: "object",
         properties: {
           chat_id: { type: "string", description: "Chat id (from list_chats)" },
-          content: { type: "string", description: "Message text" },
-          target: {
-            type: "string",
-            description: "Routing target: omit/null for coordinator, \"all\" for everyone, or a specific agent's name.",
-          },
+          content: { type: "string", description: "Message text. Include @<agent_name> or @all to control routing." },
           attachments: { type: "array", items: { type: "object" } },
         },
         required: ["chat_id", "content"],
@@ -1123,18 +1117,12 @@ ${JSON.stringify(r, null, 2)}` }] };
       args!.content as string,
       (args!.attachments as any[]) || [],
       {},
-      typeof args?.target === "string" ? (args.target as string) : null,
     );
-    const tgtLabel = !args?.target
-      ? "coordinator"
-      : args.target === "all"
-        ? "all"
-        : `@${args.target}`;
     return {
       content: [
         {
           type: "text",
-          text: `✓ Sent to chat ${args!.chat_id} → ${tgtLabel}. Recipients: ${r.recipients}, delivered: ${r.delivered_to}. ID: ${r.message_id}`,
+          text: `✓ Sent to chat ${args!.chat_id}. Recipients: ${r.recipients}, delivered: ${r.delivered_to}. ID: ${r.message_id}`,
         },
       ],
     };
