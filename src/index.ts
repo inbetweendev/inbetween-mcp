@@ -22,104 +22,20 @@ import { createHash } from "crypto";
 // =================================================================
 // CONFIG
 // =================================================================
-// Two paths to a working identity:
+// Identity model (layered auth):
+//   Layer 0 — owner-token, set via owner_login(email, password). Persisted to
+//             ~/.inbetween/owner.json so the same machine doesn't re-login.
+//   Layer 1 — agent-token, set via agent_login(token) inside a chat. Persisted
+//             to ~/.inbetween/sessions/<cwdHash>(__<pid>).json so the
+//             InBetween Codex live-push wrapper can pick it up.
 //
-//   A. STANDALONE MODE
-//      Set INBETWEEN_AUTH_TOKEN in env. No config file required.
-//      Optional: INBETWEEN_AGENT_NAME, INBETWEEN_BACKEND_URL, INBETWEEN_WS_URL.
-//      Used by:
-//        - Smithery / mcp.so / glama / pulsemcp install snippets
-//        - any user who wires `mcp.json` or `~/.codex/config.toml` by hand
-//        - Anthropic plugin allowlist submission (no extra files needed)
-//
-//   B. CONFIG-FILE MODE (default for `@inbetweenai/cli` users)
-//      Read a config.json at INBETWEEN_CONFIG_PATH, or
-//      $HOME/.inbetween/config.json, or legacy $HOME/.agentgram/config.json.
-//
-// Standalone mode wins: if the env token is set we never touch the file.
+// No config file is required at startup — both layers are populated at
+// runtime by tool calls. Missing files are normal on first launch.
 const DEFAULT_BACKEND_URL = "https://agentgram-test.up.railway.app";
 const DEFAULT_WS_URL = "wss://agentgram-test.up.railway.app/ws";
 
-function resolveConfigPath(): string {
-  const explicit =
-    process.env.INBETWEEN_CONFIG_PATH || process.env.AGENTGRAM_CONFIG_PATH;
-  if (explicit) return explicit;
-  const newPath = join(homedir(), ".inbetween", "config.json");
-  if (existsSync(newPath)) return newPath;
-  return join(homedir(), ".agentgram", "config.json");
-}
-
-interface Config {
-  agent_name: string;
-  auth_token: string;
-  backend_url: string;
-  ws_url: string;
-}
-
-const ENV_AUTH_TOKEN =
-  process.env.INBETWEEN_AUTH_TOKEN ||
-  process.env.AGENTGRAM_AUTH_TOKEN ||
-  null;
-const STANDALONE_MODE = !!ENV_AUTH_TOKEN;
-
-let config: Config;
-let CONFIG_PATH: string;
-
-if (STANDALONE_MODE) {
-  // Build a minimal config from env vars only — no disk read.
-  CONFIG_PATH = "(env)";
-  config = {
-    auth_token: ENV_AUTH_TOKEN!,
-    agent_name: process.env.INBETWEEN_AGENT_NAME || "(resolving...)",
-    backend_url:
-      process.env.INBETWEEN_BACKEND_URL ||
-      process.env.AGENTGRAM_BACKEND_URL ||
-      DEFAULT_BACKEND_URL,
-    ws_url:
-      process.env.INBETWEEN_WS_URL ||
-      process.env.AGENTGRAM_WS_URL ||
-      DEFAULT_WS_URL,
-  };
-  console.error(
-    `[inbetween] standalone mode (env token, no config file)`
-  );
-} else {
-  // No env token — try legacy config file for backward compat. Missing file is
-  // fine in the new layered-auth flow: identity arrives at runtime via
-  // owner_login(email, password) + agent_login(token), persisted to
-  // ~/.inbetween/owner.json and per-process session files.
-  CONFIG_PATH = resolveConfigPath();
-  try {
-    const raw = readFileSync(CONFIG_PATH, "utf-8");
-    config = JSON.parse(raw);
-  } catch {
-    CONFIG_PATH = "(none)";
-    config = {
-      auth_token: "",
-      agent_name: "(none)",
-      backend_url: DEFAULT_BACKEND_URL,
-      ws_url: DEFAULT_WS_URL,
-    };
-    console.error(
-      `[inbetween] no config file — waiting for owner_login(email, password).`
-    );
-  }
-}
-
-// Override через env (для testing). Принимаем INBETWEEN_* и AGENTGRAM_* (legacy).
-const BACKEND_URL =
-  process.env.INBETWEEN_BACKEND_URL ||
-  process.env.AGENTGRAM_BACKEND_URL ||
-  config.backend_url;
-const WS_URL =
-  process.env.INBETWEEN_WS_URL ||
-  process.env.AGENTGRAM_WS_URL ||
-  config.ws_url;
-// auth_token может быть либо обычный agent_token (привязан к одному агенту,
-// старый flow), либо owner_token (префикс `own_`, новый flow): один MCP может
-// становиться любым агентом owner'а через become_agent тул.
-const INITIAL_TOKEN = config.auth_token;
-const IS_OWNER_MODE = typeof INITIAL_TOKEN === "string" && INITIAL_TOKEN.startsWith("own_");
+const BACKEND_URL = process.env.INBETWEEN_BACKEND_URL || DEFAULT_BACKEND_URL;
+const WS_URL = process.env.INBETWEEN_WS_URL || DEFAULT_WS_URL;
 
 // Per-process session persistence (multi-window-safe).
 //
@@ -231,28 +147,17 @@ function clearOwner() {
 const persistedOwner = loadOwner();
 let activeOwnerToken: string | null = persistedOwner?.owner_token ?? null;
 let activeOwnerId: string | null = persistedOwner?.owner_id ?? null;
-// Backward compat: if a previous CLI `init --owner-token` wrote the owner
-// token into config.auth_token (with `own_` prefix), promote it here so the
-// user doesn't have to re-login as owner manually.
-if (!activeOwnerToken && IS_OWNER_MODE) {
-  activeOwnerToken = INITIAL_TOKEN;
-}
 
 // =================================================================
 // AGENT-LEVEL SESSION (Layer 1) — per-cwd / per-process
 // =================================================================
 const persisted = loadSession();
-let activeAgentToken: string | null = persisted?.token
-  ?? (IS_OWNER_MODE ? null : INITIAL_TOKEN);
-let activeAgentName: string | null = persisted?.name
-  ?? (IS_OWNER_MODE ? null : (config.agent_name || null));
+let activeAgentToken: string | null = persisted?.token ?? null;
+let activeAgentName: string | null = persisted?.name ?? null;
 let activeAgentId: number | null = persisted?.id ?? null;
 if (persisted) {
   console.error(`[inbetween] restored session for cwd=${process.cwd()} → @${activeAgentName} (id=${activeAgentId})`);
 }
-
-const AUTH_TOKEN = INITIAL_TOKEN;          // legacy alias for places that still read it
-const AGENT_NAME = config.agent_name || "owner-mode";
 
 // =================================================================
 // LAYER GATES
@@ -295,14 +200,8 @@ let reconnectTimer: NodeJS.Timeout | null = null;
 let messageNotifier: ((msg: Message) => void) | null = null;
 
 function connectWebSocket(): void {
-  // Owner-mode без активного агента — WS не открываем (нет идентичности для
-  // приёма real-time сообщений). После become_agent эта функция вызывается заново.
-  if (!activeAgentToken) {
-    if (IS_OWNER_MODE) {
-      console.error("[inbetween] owner-mode idle — WS skipped (call become_agent)");
-    }
-    return;
-  }
+  // No active agent yet — defer WS until agent_login arrives.
+  if (!activeAgentToken) return;
   // Wrapper-mode (e.g. inside `inbetween-codex`): the wrapper itself owns the
   // backend WS and injects messages into the host TUI directly. The MCP server
   // only serves outgoing tool calls — no WS, no inbox push. Set by the
@@ -321,7 +220,7 @@ function connectWebSocket(): void {
   });
 
   ws.on("open", () => {
-    console.error(`[inbetween] WS OPEN as @${activeAgentName || AGENT_NAME} (id=${activeAgentId}) → ${WS_URL}`);
+    console.error(`[inbetween] WS OPEN as @${activeAgentName} (id=${activeAgentId}) → ${WS_URL}`);
     setInterval(() => {
       if (ws?.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "heartbeat" }));
@@ -464,7 +363,7 @@ async function notifyClaudeAboutBatch(items: any[]): Promise<void> {
     });
     await server.notification({ method: "notifications/resources/updated", params: { uri: "inbetween://inbox" } });
   } catch (e) {
-    console.error("[agentgram] notify batch failed:", e);
+    console.error("[inbetween] notify batch failed:", e);
   }
 }
 
@@ -479,7 +378,7 @@ async function notifyClaudeAboutWake(event: any): Promise<void> {
       },
     });
   } catch (e) {
-    console.error("[agentgram] notify wake failed:", e);
+    console.error("[inbetween] notify wake failed:", e);
   }
 }
 
@@ -493,7 +392,7 @@ async function notifyClaudeAboutTask(event: any): Promise<void> {
       },
     });
   } catch (e) {
-    console.error("[agentgram] notify task failed:", e);
+    console.error("[inbetween] notify task failed:", e);
   }
 }
 
@@ -537,67 +436,8 @@ function startPolling(): void {
 }
 
 // =================================================================
-// IDENTITY SWITCHING (owner-mode runtime)
+// IDENTITY DROP — used by agent_logout tool
 // =================================================================
-// become_agent / logout / whoami — позволяют одному MCP-процессу
-// представлять любого агента owner'а в течение рантайма. Owner-token из
-// config.json обменивается на agent_token каждый раз.
-
-async function exchangeForAgentToken(agent_id: number): Promise<any> {
-  // Используем INITIAL_TOKEN явно (это owner_token), без активного агента
-  // фолбэка — потому что мы как раз переключаем активного.
-  return api("POST", "/auth/act-as", { agent_id }, { tokenOverride: INITIAL_TOKEN });
-}
-
-async function listMyAgentsViaOwner(): Promise<any> {
-  return api("GET", "/auth/my-agents", undefined, { tokenOverride: INITIAL_TOKEN });
-}
-
-async function becomeAgent(target: { agent_id?: number; name?: string }): Promise<any> {
-  if (!IS_OWNER_MODE) {
-    throw new Error("become_agent requires owner-mode (config has agent_token, not owner_token)");
-  }
-  let id = target.agent_id;
-  if (id == null && target.name) {
-    const list: any = await listMyAgentsViaOwner();
-    const found = (list.agents || []).find((a: any) => a.name === target.name);
-    if (!found) throw new Error(`No agent named @${target.name} owned by you`);
-    id = found.id;
-  }
-  if (id == null) throw new Error("Need agent_id or name");
-
-  const profile: any = await exchangeForAgentToken(id);
-
-  // Drop old WS if any.
-  try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch (e) {}
-
-  // Drop inbox cache (it was for the previous agent).
-  inbox.length = 0;
-
-  activeAgentToken = profile.auth_token;
-  activeAgentName  = profile.name;
-  activeAgentId    = profile.agent_id;
-  saveSession(profile.auth_token, profile.name, profile.agent_id);
-
-  console.error(`[inbetween] become_agent → @${profile.name} (id=${profile.agent_id})`);
-
-  // Re-open WS + ensure polling is running.
-  connectWebSocket();
-  startPolling();
-
-  // Return agent profile so the LLM sees who it now is.
-  return {
-    agent_id: profile.agent_id,
-    name: profile.name,
-    display_name: profile.display_name,
-    description: profile.description,
-    specialization: profile.specialization,
-    only_human: profile.only_human,
-    tasks_enabled: profile.tasks_enabled,
-    work_dir: profile.work_dir,
-  };
-}
-
 function logoutAgent(): void {
   try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch (e) {}
   inbox.length = 0;
@@ -617,17 +457,12 @@ async function api<T = any>(
   body?: any,
   opts?: { tokenOverride?: string }
 ): Promise<T> {
-  // Token resolution order:
-  //   1. opts.tokenOverride (для становления агентом — owner_token).
-  //   2. activeAgentToken (after become_agent).
-  //   3. INITIAL_TOKEN (legacy single-agent mode).
-  // Owner-mode без активного агента → большинство тулов кидают ошибку
-  // "no active agent" чтобы LLM позвал become_agent сначала.
-  const tok = opts?.tokenOverride || activeAgentToken || INITIAL_TOKEN;
-  if (IS_OWNER_MODE && !opts?.tokenOverride && !activeAgentToken) {
-    throw new Error(
-      "Not logged in as any agent. Call `become_agent` with an agent_id first."
-    );
+  // Token resolution: explicit override (used by owner_login validation) >
+  // activeAgentToken (set by agent_login). Layer gates ensure we never get
+  // here without a token; the explicit guard is just a defensive net.
+  const tok = opts?.tokenOverride || activeAgentToken;
+  if (!tok) {
+    throw new Error("Not authenticated. Call owner_login(email, password) and then agent_login(token).");
   }
   const res = await fetch(`${BACKEND_URL}${path}`, {
     method,
@@ -851,16 +686,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "agent_login",
       description:
-        "Become a specific agent inside a chat. Paste the auth_token from the chat onboarding prompt (the one you copied from inbetween.chat when an agent was spawned). After this, all chat tools act as that agent. Requires owner_login first. Use persist=true to remember this identity across MCP restarts in this folder/session; default is runtime-only.",
+        "Become a specific agent inside a chat. Paste the auth_token from the chat onboarding prompt (the one you copied from inbetween.chat when an agent was spawned). After this, all chat tools act as that agent. Requires owner_login first. The identity is saved to ~/.inbetween/sessions/ so MCP and the Codex live-push wrapper can restore it across restarts.",
       inputSchema: {
         type: "object",
         properties: {
           auth_token: { type: "string", description: "Agent auth token from the chat onboarding prompt" },
-          persist: {
-            type: "boolean",
-            description: "Save to disk so the same agent is restored when MCP restarts in this folder. Default false — runtime-only.",
-            default: false,
-          },
         },
         required: ["auth_token"],
       },
@@ -1148,7 +978,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (!tok || typeof tok !== "string") {
       return { content: [{ type: "text", text: "✗ auth_token required" }], isError: true };
     }
-    const persist = args?.persist === true;
     let profile: any;
     try {
       profile = await api("GET", "/agents/whoami", undefined, { tokenOverride: tok });
@@ -1158,18 +987,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     activeAgentToken = tok;
     activeAgentName = profile.name;
     activeAgentId = profile.id ?? profile.agent_id ?? null;
-    if (persist) {
-      saveSession(tok, profile.name, activeAgentId);
-    }
+    // Always write session files. The default file is what `inbetween-codex`
+    // watches to learn the active agent. Per-process file lets concurrent
+    // Claude windows in the same folder keep separate identities.
+    saveSession(tok, profile.name, activeAgentId);
     try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch {}
     connectWebSocket();
     return {
       content: [{
         type: "text",
         text:
-          `✓ Acting as @${profile.name} (id=${activeAgentId}).` +
-          (persist ? " Persisted for this folder." : " Runtime-only — pass persist=true to remember across restarts.") +
-          ` Use list_chats to see chats you're in.`,
+          `✓ Acting as @${profile.name} (id=${activeAgentId}). Use list_chats to see chats you're in.`,
       }],
     };
   }
@@ -1359,19 +1187,19 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => ({
     {
       uri: "inbetween://inbox",
       name: "InBetween Inbox",
-      description: `All messages received by @${AGENT_NAME}. Check this for incoming agent messages.`,
+      description: "All messages received by the active agent. Check this for incoming agent messages.",
       mimeType: "application/json",
     },
     {
       uri: "inbetween://profile",
       name: "My InBetween Profile",
-      description: `Profile of @${AGENT_NAME} — agent name + pending message count`,
+      description: "Profile of the active agent — name, presence, pending message count.",
       mimeType: "application/json",
     },
     {
       uri: "inbetween://tasks",
-      name: "AgentGram Tasks",
-      description: `Open and in-progress tasks for @${AGENT_NAME}.`,
+      name: "InBetween Tasks",
+      description: "Open and in-progress tasks for the active agent.",
       mimeType: "application/json",
     },
   ],
@@ -1448,7 +1276,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       api<any>("GET", "/agents/whoami").catch(() => null),
       fetchInbox(true).catch(() => ({ messages: [] })),
     ]);
-    const profile = whoamiRes || { name: AGENT_NAME };
+    const profile = whoamiRes || { name: activeAgentName ?? "(unknown)" };
     const pending = (inboxRes as any).messages || [];
     // Self-identity preamble — агент должен чётко понимать кто он и кто его
     // owner. Помещаем вверху JSON чтобы LLM видела это первым.
@@ -1508,26 +1336,10 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 // MAIN
 // =================================================================
 async function main() {
-  console.error(`[inbetween] Starting MCP server for @${AGENT_NAME}`);
-
-  // Standalone mode: env gave us a token but no agent name. Resolve it via
-  // /agents/whoami so logs and tool responses can show the real handle.
-  // Fire-and-forget; we don't block startup waiting for HTTP.
-  if (STANDALONE_MODE && config.agent_name === "(resolving...)") {
-    (async () => {
-      try {
-        const profile: any = await api("GET", "/agents/whoami", undefined, {
-          tokenOverride: ENV_AUTH_TOKEN!,
-        });
-        activeAgentName = profile.name;
-        activeAgentId = profile.id ?? null;
-        console.error(
-          `[inbetween] standalone whoami resolved → @${profile.name} (id=${profile.id})`
-        );
-      } catch (e) {
-        console.error(`[inbetween] standalone whoami failed: ${e}`);
-      }
-    })();
+  if (activeAgentName) {
+    console.error(`[inbetween] Starting MCP server (restored session @${activeAgentName})`);
+  } else {
+    console.error("[inbetween] Starting MCP server — waiting for owner_login + agent_login");
   }
 
   // Defer WS + polling до тех пор, пока CC не пришлёт `notifications/initialized`.
@@ -1539,8 +1351,8 @@ async function main() {
   const startNetwork = () => {
     if (networkStarted) return;
     networkStarted = true;
-    if (IS_OWNER_MODE && !activeAgentToken) {
-      console.error("[inbetween] MCP initialized — owner-mode idle (call become_agent)");
+    if (!activeAgentToken) {
+      console.error("[inbetween] MCP initialized — idle (call agent_login to enable WS push)");
       return;
     }
     console.error("[inbetween] MCP initialized — connecting WS + polling");
