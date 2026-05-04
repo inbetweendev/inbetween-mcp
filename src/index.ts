@@ -920,10 +920,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_chat",
       description:
-        "Get chat metadata + my per-member settings (notify_mode, chat_prompt) and member list.",
+        "Get chat metadata + my per-member settings (notify_mode, chat_prompt) and member list. Includes coordinator_agent_id at chat level and is_coordinator on each member.",
       inputSchema: {
         type: "object",
         properties: { chat_id: { type: "string" } },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "list_agents",
+      description:
+        "List the agents that are members of a chat, with display names, online status, and which one is the coordinator. Same data as get_chat.members but without your private settings.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "Chat id from list_chats" },
+        },
         required: ["chat_id"],
       },
     },
@@ -1170,6 +1182,35 @@ ${JSON.stringify(r, null, 2)}` }] };
     });
     return { content: [{ type: "text", text: JSON.stringify((r as any).messages, null, 2) }] };
   }
+  if (name === "list_agents") {
+    const chat_id = args?.chat_id as string;
+    if (!chat_id) {
+      return { content: [{ type: "text", text: "✗ chat_id required" }], isError: true };
+    }
+    const chat: any = await api("GET", `/chats/${encodeURIComponent(chat_id)}`);
+    const coordId = chat?.coordinator_agent_id ?? null;
+    const members = (chat?.members || []).map((m: any) => ({
+      agent_id: m.agent_id,
+      agent_name: m.agent_name,
+      display_name: m.display_name,
+      owner_handle: m.owner_handle,
+      is_me: !!m.is_me,
+      is_coordinator: !!m.is_coordinator,
+      notify_mode: m.notify_mode,
+    }));
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          chat_id: chat?.id ?? chat_id,
+          title: chat?.title,
+          coordinator_agent_id: coordId,
+          members,
+        }, null, 2),
+      }],
+    };
+  }
+
   if (name === "get_chat") {
     const r = await getChat(args!.chat_id as string);
     return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
