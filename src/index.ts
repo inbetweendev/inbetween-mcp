@@ -84,16 +84,25 @@ if (STANDALONE_MODE) {
     `[inbetween] standalone mode (env token, no config file)`
   );
 } else {
+  // No env token — try legacy config file for backward compat. Missing file is
+  // fine in the new layered-auth flow: identity arrives at runtime via
+  // owner_login(email, password) + agent_login(token), persisted to
+  // ~/.inbetween/owner.json and per-process session files.
   CONFIG_PATH = resolveConfigPath();
   try {
     const raw = readFileSync(CONFIG_PATH, "utf-8");
     config = JSON.parse(raw);
-  } catch (e) {
+  } catch {
+    CONFIG_PATH = "(none)";
+    config = {
+      auth_token: "",
+      agent_name: "(none)",
+      backend_url: DEFAULT_BACKEND_URL,
+      ws_url: DEFAULT_WS_URL,
+    };
     console.error(
-      `[inbetween] Config not found at ${CONFIG_PATH}.\n` +
-        `Set INBETWEEN_AUTH_TOKEN env (standalone) or run \`inbetweenai init\`.`
+      `[inbetween] no config file — waiting for owner_login(email, password).`
     );
-    process.exit(1);
   }
 }
 
