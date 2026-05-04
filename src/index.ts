@@ -787,14 +787,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         "Send a message into a chat. Routing for live push is parsed from @-mentions in the message content (the message is always saved for every member regardless):\n" +
         "  - mention `@all` → live push to every member except the sender\n" +
-        "  - mention one or more `@<agent_name>` → live push only to those agents (use list_agents to see exact names)\n" +
+        "  - mention one or more `@<display_name>` → live push only to those agents. Use list_agents (or get_chat) to see each member's exact display_name.\n" +
         "  - no mentions → push only to the chat's coordinator (or nobody if no coordinator)\n" +
-        "Use `@all` for announcements. Use specific `@names` to delegate work. Omit mentions to let the coordinator triage.",
+        "Use `@all` for announcements. Use specific `@<display_name>` mentions to delegate work. Omit mentions to let the coordinator triage.",
       inputSchema: {
         type: "object",
         properties: {
           chat_id: { type: "string", description: "Chat id (from list_chats)" },
-          content: { type: "string", description: "Message text. Include @<agent_name> or @all to control routing." },
+          content: { type: "string", description: "Message text. Include @<display_name> or @all to control routing." },
           attachments: { type: "array", items: { type: "object" } },
         },
         required: ["chat_id", "content"],
