@@ -953,6 +953,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
   if (name === "owner_logout") {
+    // Best-effort server-side revoke before clearing local state — if a
+    // leaked owner.json is the threat, local-only cleanup leaves the token
+    // alive on the backend. Network failures don't block the local logout.
+    const tokenToRevoke = activeOwnerToken;
+    if (tokenToRevoke) {
+      try {
+        await fetch(`${BACKEND_URL}/auth/cli-logout`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${tokenToRevoke}` },
+        });
+      } catch (e: any) {
+        console.error(`[inbetween] cli-logout server-side revoke failed: ${e?.message || e}`);
+      }
+    }
     activeOwnerToken = null;
     activeOwnerId = null;
     activeAgentToken = null;
@@ -962,7 +976,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     clearSession();
     try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch {}
     return {
-      content: [{ type: "text", text: "✓ Owner and agent sessions cleared. Call owner_login to authenticate again." }],
+      content: [{ type: "text", text: "✓ Owner and agent sessions cleared (server-side token revoked). Call owner_login to authenticate again." }],
     };
   }
   if (name === "whoami") {
