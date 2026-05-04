@@ -14,7 +14,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import WebSocket from "ws";
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { createHash } from "crypto";
@@ -82,14 +82,19 @@ function saveSession(token: string, name: string, id: number | null) {
     2,
   );
   try {
-    mkdirSync(SESSION_DIR, { recursive: true });
+    // 0o700 on the dir so a sibling user can't even list session files; 0o600
+    // on each file so only this user can read the agent token. chmodSync
+    // bypasses umask. No-op on Windows; NTFS already isolates homedir per-user.
+    mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
     // Per-process file: this Claude window's current identity. Always wins on
     // subsequent reads from this same process key.
-    writeFileSync(SESSION_FILE_PROC, payload);
+    writeFileSync(SESSION_FILE_PROC, payload, { mode: 0o600 });
+    try { chmodSync(SESSION_FILE_PROC, 0o600); } catch {}
     // Default file: also updated so a brand-new MCP boot in this folder picks
     // up the most recent intent. A second concurrent window will create its
     // own per-process file, overriding this default for itself.
-    writeFileSync(SESSION_FILE_DEFAULT, payload);
+    writeFileSync(SESSION_FILE_DEFAULT, payload, { mode: 0o600 });
+    try { chmodSync(SESSION_FILE_DEFAULT, 0o600); } catch {}
     console.error(`[inbetween] session saved → ${SESSION_FILE_PROC} (${name}/${id})`);
   } catch (e) {
     console.error(`[inbetween] session save failed: ${e}`);
@@ -132,10 +137,14 @@ function loadOwner(): { owner_token: string; owner_id?: string } | null {
 }
 function saveOwner(owner_token: string, owner_id?: string) {
   try {
-    mkdirSync(join(homedir(), ".inbetween"), { recursive: true });
-    writeFileSync(OWNER_FILE, JSON.stringify(
-      { owner_token, owner_id, saved_at: new Date().toISOString() }, null, 2,
-    ));
+    mkdirSync(join(homedir(), ".inbetween"), { recursive: true, mode: 0o700 });
+    const payload = JSON.stringify(
+      { owner_token, owner_id, saved_at: new Date().toISOString() },
+      null,
+      2,
+    );
+    writeFileSync(OWNER_FILE, payload, { mode: 0o600 });
+    try { chmodSync(OWNER_FILE, 0o600); } catch {}
   } catch (e) {
     console.error(`[inbetween] owner save failed: ${e}`);
   }
