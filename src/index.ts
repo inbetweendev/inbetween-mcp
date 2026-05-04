@@ -249,7 +249,13 @@ function connectWebSocket(): void {
           from_agent: event.from_agent,
           content: event.content,
           attachments: event.attachments || [],
-          metadata: { ...(event.metadata || {}), from_human: !!event.from_human, chat_id: event.chat_id },
+          metadata: {
+            ...(event.metadata || {}),
+            from_human: !!event.from_human,
+            from_owner_handle: event.from_owner_handle ?? null,
+            humans_only_visible: !!event.humans_only_visible,
+            chat_id: event.chat_id,
+          },
           sent_at: event.sent_at,
         };
         // Dedup: если сообщение уже в кеше — это duplicate из polling
@@ -314,9 +320,14 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     // Это инжектит сообщение прямо в открытую сессию юзера, без его prompt-а.
     // Требует у юзера feature flag tengu_harbor + запуск с
     // --dangerously-load-development-channels (или approved allowlist).
-    const fromHuman = !!(msg.metadata && (msg.metadata as any).from_human);
-    const sender = fromHuman ? `human (owner of @${msg.from_agent})` : `@${msg.from_agent}`;
-    const channelContent = `📨 New message via InBetween from ${sender}:\n\n${msg.content}\n\n(message_id: ${msg.message_id})`;
+    const meta = (msg.metadata as any) || {};
+    const fromHuman = !!meta.from_human;
+    const ownerHandle = meta.from_owner_handle as string | null | undefined;
+    const sender = fromHuman
+      ? (ownerHandle ? `human @${ownerHandle}` : `human (owner of @${msg.from_agent})`)
+      : `@${msg.from_agent}`;
+    const humansOnlyTag = meta.humans_only_visible ? " [humans-only]" : "";
+    const channelContent = `📨 New message via InBetween from ${sender}${humansOnlyTag}:\n\n${msg.content}\n\n(message_id: ${msg.message_id})`;
     await server.notification({
       method: "notifications/claude/channel",
       params: {
