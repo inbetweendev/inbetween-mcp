@@ -587,36 +587,6 @@ async function fetchInbox(pending_only = false) {
   return api("GET", `/inbox?pending_only=${pending_only}`);
 }
 
-async function searchAgents(query: string) {
-  const res = await fetch(
-    `${BACKEND_URL}/agents?search=${encodeURIComponent(query)}`
-  );
-  return res.json();
-}
-
-// === GROUPS ===
-async function createGroup(name: string, description: string | undefined, members: string[]) {
-  return api("POST", "/groups", { name, description, members });
-}
-async function inviteToGroup(groupName: string, members: string[]) {
-  return api("POST", `/groups/${encodeURIComponent(groupName)}/invite`, { members });
-}
-async function acceptGroupInvite(groupName: string) {
-  return api("POST", `/groups/${encodeURIComponent(groupName)}/accept`);
-}
-async function leaveGroup(groupName: string) {
-  return api("POST", `/groups/${encodeURIComponent(groupName)}/leave`);
-}
-async function sendToGroup(groupName: string, content: string, attachments: any[] = []) {
-  return api("POST", `/groups/${encodeURIComponent(groupName)}/messages`, {
-    content,
-    attachments,
-  });
-}
-async function listGroups() {
-  return api("GET", "/groups");
-}
-
 // === USER FEATURES (v0.0.8) ===
 async function markRead(message_id: string) {
   return api("POST", `/messages/${encodeURIComponent(message_id)}/read`);
@@ -659,12 +629,6 @@ async function clearChatPrompt(other: string) {
 }
 async function effectivePrompt(other: string) {
   return api("GET", `/agents/me/prompts/effective/${encodeURIComponent(other)}`);
-}
-async function wakeAgent(name: string, reason?: string) {
-  return api("POST", `/agents/${encodeURIComponent(name)}/wake`, { reason });
-}
-async function ackWake(request_id: string, status: "acknowledged" | "completed" | "failed", error?: string) {
-  return api("PATCH", `/wake-requests/${encodeURIComponent(request_id)}`, { status, error });
 }
 async function listTasks(status?: string, limit = 50) {
   const qs = status ? `?status=${encodeURIComponent(status)}&limit=${limit}` : `?limit=${limit}`;
@@ -893,7 +857,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "list_chats",
       description:
-        "List all your chats (direct + groups) with last message, unread count, and other-side online status. Sorted by recency.",
+        "List all your chats with last message, unread count, and other-side online status. Sorted by recency.",
       inputSchema: { type: "object", properties: {} },
     },
     {
@@ -990,7 +954,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "inbox_unread",
       description:
-        "Get all my unread messages across every chat (direct + groups), newest first. Optionally filter by `since` timestamp.",
+        "Get all my unread messages across every chat, newest first. Optionally filter by `since` timestamp.",
       inputSchema: {
         type: "object",
         properties: {
