@@ -1001,20 +1001,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } catch (e: any) {
       return { content: [{ type: "text", text: `✗ Invalid agent token: ${e.message || e}` }], isError: true };
     }
+    // display_name is the user-visible identifier; agents.name is internal
+    // (Phase 2 will drop it). Fall back to name only if display_name is
+    // somehow missing — shouldn't happen after migration 029.
+    const visibleName = profile.display_name || profile.name;
     activeAgentToken = tok;
-    activeAgentName = profile.name;
+    activeAgentName = visibleName;
     activeAgentId = profile.id ?? profile.agent_id ?? null;
     // Always write session files. The default file is what `inbetween-codex`
     // watches to learn the active agent. Per-process file lets concurrent
     // Claude windows in the same folder keep separate identities.
-    saveSession(tok, profile.name, activeAgentId);
+    saveSession(tok, visibleName, activeAgentId);
     try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch {}
     connectWebSocket();
     return {
       content: [{
         type: "text",
         text:
-          `✓ Acting as @${profile.name} (id=${activeAgentId}). Use list_chats to see chats you're in.`,
+          `✓ Acting as @${visibleName} (id=${activeAgentId}). Use list_chats to see chats you're in.`,
       }],
     };
   }
@@ -1287,18 +1291,19 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       api<any>("GET", "/agents/whoami").catch(() => null),
       fetchInbox(true).catch(() => ({ messages: [] })),
     ]);
-    const profile = whoamiRes || { name: activeAgentName ?? "(unknown)" };
+    const profile = whoamiRes || { display_name: activeAgentName ?? "(unknown)", name: null };
     const pending = (inboxRes as any).messages || [];
     // Self-identity preamble — агент должен чётко понимать кто он и кто его
     // owner. Помещаем вверху JSON чтобы LLM видела это первым.
+    const visibleName = profile.display_name || profile.name || "(unknown)";
     const ownerLabel = profile.owner_handle ? `@${profile.owner_handle}` : "(unnamed owner)";
     const identity = {
-      i_am: `@${profile.name}`,
+      i_am: `@${visibleName}`,
       my_owner: ownerLabel,
       note:
         "When a message has from_human=true, it is from " + ownerLabel + " (the OWNER, a real person) " +
         "— not from another agent. When from_human=false, it is from another agent. " +
-        "You speak as @" + profile.name + " — never claim to be the owner.",
+        "You speak as @" + visibleName + " — never claim to be the owner.",
     };
     return {
       contents: [
