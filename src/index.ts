@@ -250,7 +250,7 @@ const AGENT_NAME = config.agent_name || "owner-mode";
 // =================================================================
 function requireOwner(): string | null {
   if (!activeOwnerToken) {
-    return "Not authenticated. Call owner_login(owner_token) first — paste the token from your inbetween.chat dashboard.";
+    return "Not authenticated. Call owner_login(email, password) first using your inbetween.chat account.";
   }
   return null;
 }
@@ -816,13 +816,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "owner_login",
       description:
-        "Authenticate this MCP session as a human owner. Paste the owner token from your inbetween.chat dashboard (Settings → CLI access). MUST be called before any other tool — agent_login and chat operations are gated behind this. Persists to ~/.inbetween/owner.json so future MCP boots pick it up automatically.",
+        "Authenticate this MCP session as a human owner using your inbetween.chat email and password. MUST be called before any other tool — agent_login and chat operations are gated behind this. The credentials are exchanged for a long-lived owner token that persists to ~/.inbetween/owner.json so future MCP boots pick it up automatically. Email and password are never written to disk.",
       inputSchema: {
         type: "object",
         properties: {
-          owner_token: { type: "string", description: "Owner token (starts with 'own_'). Get it from your inbetween.chat dashboard." },
+          email: { type: "string", description: "Email of your inbetween.chat account" },
+          password: { type: "string", description: "Password of your inbetween.chat account" },
         },
-        required: ["owner_token"],
+        required: ["email", "password"],
       },
     },
     {
@@ -1060,31 +1061,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   // ===== Layer 0 — owner auth =====
   if (name === "owner_login") {
-    const tok = args?.owner_token as string;
-    if (!tok || typeof tok !== "string") {
-      return { content: [{ type: "text", text: "✗ owner_token required" }], isError: true };
+    const email = typeof args?.email === "string" ? (args.email as string).trim() : "";
+    const password = typeof args?.password === "string" ? (args.password as string) : "";
+    if (!email || !password) {
+      return { content: [{ type: "text", text: "✗ email and password required" }], isError: true };
     }
-    if (!tok.startsWith("own_")) {
-      return {
-        content: [{ type: "text", text: "✗ owner tokens start with 'own_'. Get yours from inbetween.chat dashboard." }],
-        isError: true,
-      };
+    if (!email.includes("@")) {
+      return { content: [{ type: "text", text: "✗ email looks invalid" }], isError: true };
     }
-    // Validate by hitting an owner-only endpoint.
+    let owner_token: string | undefined;
     let owner_id: string | undefined;
     try {
-      const r: any = await api("GET", "/auth/my-agents", undefined, { tokenOverride: tok });
-      owner_id = r?.owner_id;
+      const res = await fetch(`${BACKEND_URL}/auth/cli-login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+      if (!res.ok) {
+        let detail = `${res.status} ${res.statusText}`;
+        try {
+          const body: any = await res.json();
+          if (body?.detail) detail = body.detail;
+        } catch {}
+        return { content: [{ type: "text", text: `✗ Login failed: ${detail}` }], isError: true };
+      }
+      const data: any = await res.json();
+      owner_token = data?.owner_token;
+      owner_id = data?.owner_id;
     } catch (e: any) {
-      return { content: [{ type: "text", text: `✗ Invalid owner token: ${e.message || e}` }], isError: true };
+      return { content: [{ type: "text", text: `✗ Login failed: ${e?.message || e}` }], isError: true };
     }
-    activeOwnerToken = tok;
+    if (!owner_token) {
+      return { content: [{ type: "text", text: "✗ Login response missing owner_token" }], isError: true };
+    }
+    activeOwnerToken = owner_token;
     activeOwnerId = owner_id ?? null;
-    saveOwner(tok, owner_id);
+    saveOwner(owner_token, owner_id);
     return {
       content: [{
         type: "text",
-        text: `✓ Owner login successful. Session persisted to ~/.inbetween/owner.json.\nNext: paste an agent onboarding prompt (or call agent_login(token)) to start acting as an agent in a chat.`,
+        text: `✓ Signed in as owner. Session persisted to ~/.inbetween/owner.json.\nNext: paste an agent onboarding prompt (or call agent_login(token)) to start acting as an agent in a chat.`,
       }],
     };
   }
@@ -1110,7 +1126,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         name: activeAgentName,
       } : null,
     };
-    if (!activeOwnerToken) state.note = "Not authenticated. Call owner_login(owner_token) first.";
+    if (!activeOwnerToken) state.note = "Not authenticated. Call owner_login(email, password) first.";
     else if (!activeAgentToken) state.note = "Owner authenticated. Now paste an agent onboarding prompt or call agent_login(token).";
     return { content: [{ type: "text", text: JSON.stringify(state, null, 2) }] };
   }
