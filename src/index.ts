@@ -184,7 +184,54 @@ process.on("exit", cleanupProcessSessionFile);
 process.on("SIGINT", () => { cleanupProcessSessionFile(); process.exit(0); });
 process.on("SIGTERM", () => { cleanupProcessSessionFile(); process.exit(0); });
 
-// Active session state — меняется при login / become_agent / logout.
+// =================================================================
+// OWNER-LEVEL SESSION (Layer 0) — `~/.inbetween/owner.json`
+// =================================================================
+// Two-layer auth model:
+//   Layer 0 — owner-token (humanly registered via web). Persisted globally
+//             across all MCP processes on this machine. Required before any
+//             other tool call.
+//   Layer 1 — agent identity (ephemeral, comes from chat onboarding prompts).
+//             Per-process, optionally persisted via agent_login(persist=true).
+const OWNER_FILE = join(homedir(), ".inbetween", "owner.json");
+function loadOwner(): { owner_token: string; owner_id?: string } | null {
+  try {
+    if (!existsSync(OWNER_FILE)) return null;
+    const raw = readFileSync(OWNER_FILE, "utf-8").trim();
+    if (!raw || raw === "{}") return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error(`[inbetween] owner load failed: ${e}`);
+    return null;
+  }
+}
+function saveOwner(owner_token: string, owner_id?: string) {
+  try {
+    mkdirSync(join(homedir(), ".inbetween"), { recursive: true });
+    writeFileSync(OWNER_FILE, JSON.stringify(
+      { owner_token, owner_id, saved_at: new Date().toISOString() }, null, 2,
+    ));
+  } catch (e) {
+    console.error(`[inbetween] owner save failed: ${e}`);
+  }
+}
+function clearOwner() {
+  try { if (existsSync(OWNER_FILE)) writeFileSync(OWNER_FILE, "{}"); } catch {}
+}
+
+const persistedOwner = loadOwner();
+let activeOwnerToken: string | null = persistedOwner?.owner_token ?? null;
+let activeOwnerId: string | null = persistedOwner?.owner_id ?? null;
+// Backward compat: if a previous CLI `init --owner-token` wrote the owner
+// token into config.auth_token (with `own_` prefix), promote it here so the
+// user doesn't have to re-login as owner manually.
+if (!activeOwnerToken && IS_OWNER_MODE) {
+  activeOwnerToken = INITIAL_TOKEN;
+}
+
+// =================================================================
+// AGENT-LEVEL SESSION (Layer 1) — per-cwd / per-process
+// =================================================================
 const persisted = loadSession();
 let activeAgentToken: string | null = persisted?.token
   ?? (IS_OWNER_MODE ? null : INITIAL_TOKEN);
@@ -197,6 +244,24 @@ if (persisted) {
 
 const AUTH_TOKEN = INITIAL_TOKEN;          // legacy alias for places that still read it
 const AGENT_NAME = config.agent_name || "owner-mode";
+
+// =================================================================
+// LAYER GATES
+// =================================================================
+function requireOwner(): string | null {
+  if (!activeOwnerToken) {
+    return "Not authenticated. Call owner_login(owner_token) first — paste the token from your inbetween.chat dashboard.";
+  }
+  return null;
+}
+function requireAgent(): string | null {
+  const o = requireOwner();
+  if (o) return o;
+  if (!activeAgentToken) {
+    return "No active agent. Call agent_login(auth_token) with the token from your chat onboarding prompt.";
+  }
+  return null;
+}
 
 // =================================================================
 // LOCAL INBOX (in-memory cache)
@@ -740,69 +805,54 @@ const server = new Server(
 // === TOOLS ===
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
-    // ===== Identity (owner-mode) =====
+    // ===== Layer 0 — owner-level auth =====
     {
-      name: "become_agent",
+      name: "owner_login",
       description:
-        "Switch this MCP session to act as one of the owner's agents. After calling, all other tools (send_message, get_inbox, chat_messages, etc.) act as that agent. Required first call when this MCP starts in owner-mode (config has owner_token instead of agent_token). Pass either agent_id (numeric) or name (string).",
+        "Authenticate this MCP session as a human owner. Paste the owner token from your inbetween.chat dashboard (Settings → CLI access). MUST be called before any other tool — agent_login and chat operations are gated behind this. Persists to ~/.inbetween/owner.json so future MCP boots pick it up automatically.",
       inputSchema: {
         type: "object",
         properties: {
-          agent_id: { type: "number", description: "Numeric agent id" },
-          name: { type: "string", description: "Agent name (e.g. 'design')" },
+          owner_token: { type: "string", description: "Owner token (starts with 'own_'). Get it from your inbetween.chat dashboard." },
         },
+        required: ["owner_token"],
       },
     },
     {
-      name: "login",
+      name: "owner_logout",
       description:
-        "Switch the MCP session to a different agent identity by raw auth_token. Use this when you receive a welcome message containing an auth code (e.g. when spawned as an ephemeral agent into a chat). Validates the token and makes all subsequent tool calls act as the new agent. Works regardless of how this MCP was originally configured (single-agent, owner-mode, or another agent).",
+        "Drop the owner session. After this all tools are blocked until owner_login is called again. Also clears any active agent_login.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "whoami",
+      description:
+        "Show who this MCP session is currently logged in as. Returns owner status, active agent (if any), and current chat context.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    // ===== Layer 1 — agent identity inside the chat =====
+    {
+      name: "agent_login",
+      description:
+        "Become a specific agent inside a chat. Paste the auth_token from the chat onboarding prompt (the one you copied from inbetween.chat when an agent was spawned). After this, all chat tools act as that agent. Requires owner_login first. Use persist=true to remember this identity across MCP restarts in this folder/session; default is runtime-only.",
       inputSchema: {
         type: "object",
         properties: {
-          auth_token: { type: "string", description: "Agent auth token from the welcome prompt" },
+          auth_token: { type: "string", description: "Agent auth token from the chat onboarding prompt" },
+          persist: {
+            type: "boolean",
+            description: "Save to disk so the same agent is restored when MCP restarts in this folder. Default false — runtime-only.",
+            default: false,
+          },
         },
         required: ["auth_token"],
       },
     },
     {
-      name: "whoami",
+      name: "agent_logout",
       description:
-        "Show who this MCP session is currently logged in as. Returns the active agent (after become_agent) or `idle` if owner-mode hasn't picked one yet.",
+        "Drop the current agent identity. The owner session stays active — you can call agent_login with a different agent token next.",
       inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "logout",
-      description:
-        "Drop the active agent identity in owner-mode and return to idle. After this you must call become_agent again before using other tools.",
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "list_my_agents",
-      description:
-        "List agents this owner controls. In owner-mode lists everyone you own (including ephemeral). Useful before become_agent to see the available ids.",
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "send_message",
-      description:
-        "Send a message to another agent in the InBetween network. Use the agent's name (e.g. 'vova-backend' without @).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          to_agent: {
-            type: "string",
-            description: "Recipient agent name (без @, e.g. 'vova-backend')",
-          },
-          content: { type: "string", description: "Message content" },
-          attachments: {
-            type: "array",
-            description: "Optional attachments (code blocks, files, etc)",
-            items: { type: "object" },
-          },
-        },
-        required: ["to_agent", "content"],
-      },
     },
     {
       name: "update_profile",
@@ -978,97 +1028,116 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
+// Tool name → required layer.
+const LAYER0_TOOLS = new Set(["owner_login", "owner_logout", "whoami"]);
+const LAYER1_TOOLS = new Set(["agent_login", "agent_logout"]);
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
-  // ===== Identity =====
-  if (name === "become_agent") {
-    const profile = await becomeAgent({
-      agent_id: args?.agent_id as number | undefined,
-      name: args?.name as string | undefined,
-    });
+  // Gate: every Layer-2 tool (everything not in LAYER0/LAYER1) requires
+  // both owner_login AND agent_login. We check up-front so each handler
+  // body can assume identity is set.
+  if (!LAYER0_TOOLS.has(name) && !LAYER1_TOOLS.has(name)) {
+    const err = requireAgent();
+    if (err) return { content: [{ type: "text", text: `✗ ${err}` }], isError: true };
+  }
+
+  // ===== Layer 0 — owner auth =====
+  if (name === "owner_login") {
+    const tok = args?.owner_token as string;
+    if (!tok || typeof tok !== "string") {
+      return { content: [{ type: "text", text: "✗ owner_token required" }], isError: true };
+    }
+    if (!tok.startsWith("own_")) {
+      return {
+        content: [{ type: "text", text: "✗ owner tokens start with 'own_'. Get yours from inbetween.chat dashboard." }],
+        isError: true,
+      };
+    }
+    // Validate by hitting an owner-only endpoint.
+    let owner_id: string | undefined;
+    try {
+      const r: any = await api("GET", "/auth/my-agents", undefined, { tokenOverride: tok });
+      owner_id = r?.owner_id;
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `✗ Invalid owner token: ${e.message || e}` }], isError: true };
+    }
+    activeOwnerToken = tok;
+    activeOwnerId = owner_id ?? null;
+    saveOwner(tok, owner_id);
     return {
       content: [{
         type: "text",
-        text: `✓ Now acting as @${profile.name} (id=${profile.agent_id}).\n\n${JSON.stringify(profile, null, 2)}`,
+        text: `✓ Owner login successful. Session persisted to ~/.inbetween/owner.json.\nNext: paste an agent onboarding prompt (or call agent_login(token)) to start acting as an agent in a chat.`,
       }],
     };
   }
-  if (name === "login") {
+  if (name === "owner_logout") {
+    activeOwnerToken = null;
+    activeOwnerId = null;
+    activeAgentToken = null;
+    activeAgentName = null;
+    activeAgentId = null;
+    clearOwner();
+    clearSession();
+    try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch {}
+    return {
+      content: [{ type: "text", text: "✓ Owner and agent sessions cleared. Call owner_login to authenticate again." }],
+    };
+  }
+  if (name === "whoami") {
+    const state: any = {
+      owner: !!activeOwnerToken,
+      owner_id: activeOwnerId,
+      agent: activeAgentToken ? {
+        agent_id: activeAgentId,
+        name: activeAgentName,
+      } : null,
+    };
+    if (!activeOwnerToken) state.note = "Not authenticated. Call owner_login(owner_token) first.";
+    else if (!activeAgentToken) state.note = "Owner authenticated. Now paste an agent onboarding prompt or call agent_login(token).";
+    return { content: [{ type: "text", text: JSON.stringify(state, null, 2) }] };
+  }
+
+  // ===== Layer 1 — agent auth =====
+  if (name === "agent_login") {
+    const ownerErr = requireOwner();
+    if (ownerErr) return { content: [{ type: "text", text: `✗ ${ownerErr}` }], isError: true };
     const tok = args?.auth_token as string;
     if (!tok || typeof tok !== "string") {
       return { content: [{ type: "text", text: "✗ auth_token required" }], isError: true };
     }
-    const profile: any = await api("GET", "/agents/whoami", undefined, { tokenOverride: tok });
+    const persist = args?.persist === true;
+    let profile: any;
+    try {
+      profile = await api("GET", "/agents/whoami", undefined, { tokenOverride: tok });
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `✗ Invalid agent token: ${e.message || e}` }], isError: true };
+    }
     activeAgentToken = tok;
     activeAgentName = profile.name;
     activeAgentId = profile.id ?? profile.agent_id ?? null;
-    saveSession(tok, profile.name, activeAgentId);
+    if (persist) {
+      saveSession(tok, profile.name, activeAgentId);
+    }
     try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch {}
     connectWebSocket();
     return {
       content: [{
         type: "text",
-        text: `✓ Logged in as @${profile.name} (id=${activeAgentId}). Session persisted for this folder. Use list_chats to see chats you're in.`,
+        text:
+          `✓ Acting as @${profile.name} (id=${activeAgentId}).` +
+          (persist ? " Persisted for this folder." : " Runtime-only — pass persist=true to remember across restarts.") +
+          ` Use list_chats to see chats you're in.`,
       }],
     };
   }
-  if (name === "whoami") {
-    const state = activeAgentToken
-      ? {
-          status: "active",
-          agent_id: activeAgentId,
-          name: activeAgentName,
-          mode: IS_OWNER_MODE ? "owner" : "single-agent",
-        }
-      : {
-          status: "idle",
-          mode: IS_OWNER_MODE ? "owner" : "single-agent",
-          note: IS_OWNER_MODE ? "Call become_agent(id) to start acting as one of your agents." : "single-agent mode but no active token (unexpected)",
-        };
-    return { content: [{ type: "text", text: JSON.stringify(state, null, 2) }] };
-  }
-  if (name === "logout") {
+  if (name === "agent_logout") {
+    const ownerErr = requireOwner();
+    if (ownerErr) return { content: [{ type: "text", text: `✗ ${ownerErr}` }], isError: true };
     logoutAgent();
-    return { content: [{ type: "text", text: "✓ Logged out. Call become_agent to act as a different agent." }] };
-  }
-  if (name === "list_my_agents") {
-    if (IS_OWNER_MODE) {
-      const r: any = await listMyAgentsViaOwner();
-      return { content: [{ type: "text", text: JSON.stringify(r.agents, null, 2) }] };
-    }
-    return {
-      content: [{ type: "text", text: "single-agent mode — list_my_agents not applicable. You are @" + AGENT_NAME }],
-    };
-  }
-
-  if (name === "send_message") {
-    const result: any = await sendMessage(
-      args!.to_agent as string,
-      args!.content as string,
-      (args!.attachments as any[]) || []
-    );
-    // 202 friend_request_sent / friend_request_pending — backend возвращает
-    // {ok:false, status:'friend_request_*', detail:'...'}. Различаем чтобы
-    // не показать misleading "✓ sent. Delivered: undefined".
-    if (result && result.status && result.status.startsWith("friend_request")) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `⏳ Friend-request gate: ${result.detail || result.status}. Wait for @${args!.to_agent} to accept your contact.`,
-          },
-        ],
-      };
-    }
-    return {
-      content: [
-        {
-          type: "text",
-          text: `✓ Message sent to @${args!.to_agent}. Delivered: ${result.delivered}. ID: ${result.message_id}`,
-        },
-      ],
-    };
+    return { content: [{ type: "text", text: "✓ Agent identity cleared. Owner session is still active — paste another agent prompt or call agent_login(token)." }] };
   }
 
   if (name === "update_profile") {
