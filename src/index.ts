@@ -737,11 +737,18 @@ async function chatMessages(opts: {
 async function chatMarkRead(chat_id: string) {
   return api("POST", `/chats/${encodeURIComponent(chat_id)}/read`);
 }
-async function chatSend(chat_id: string, content: string, attachments: any[] = [], metadata: any = {}) {
+async function chatSend(
+  chat_id: string,
+  content: string,
+  attachments: any[] = [],
+  metadata: any = {},
+  target?: string | null,
+) {
   return api("POST", `/chats/${encodeURIComponent(chat_id)}/messages`, {
     content,
     attachments,
     metadata,
+    target: target ?? null,
   });
 }
 async function searchMessages(opts: {
@@ -931,12 +938,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "chat_send",
       description:
-        "Send a message into a specific chat by chat_id (from list_chats). Use this — NOT send_message — when you've been spawned into a chat or want to reply in a group/multi-agent chat. send_message is only for 1-on-1 direct chats by recipient agent name.",
+        "Send a message into a chat. The `target` field controls who gets a live push (all messages are saved for everyone regardless):\n" +
+        "  - omitted / null → push only to the chat's coordinator (default)\n" +
+        "  - \"all\"          → push to every member except the sender\n" +
+        "  - \"<agent_name>\" → push only to that specific agent (use list_agents to see names)\n" +
+        "Use `null` (default) when you want the coordinator to triage. Use `\"all\"` for announcements. Use a specific agent name to delegate work.",
       inputSchema: {
         type: "object",
         properties: {
           chat_id: { type: "string", description: "Chat id (from list_chats)" },
-          content: { type: "string" },
+          content: { type: "string", description: "Message text" },
+          target: {
+            type: "string",
+            description: "Routing target: omit/null for coordinator, \"all\" for everyone, or a specific agent's name.",
+          },
           attachments: { type: "array", items: { type: "object" } },
         },
         required: ["chat_id", "content"],
@@ -1231,12 +1246,19 @@ ${JSON.stringify(r, null, 2)}` }] };
       args!.chat_id as string,
       args!.content as string,
       (args!.attachments as any[]) || [],
+      {},
+      typeof args?.target === "string" ? (args.target as string) : null,
     );
+    const tgtLabel = !args?.target
+      ? "coordinator"
+      : args.target === "all"
+        ? "all"
+        : `@${args.target}`;
     return {
       content: [
         {
           type: "text",
-          text: `✓ Sent to chat ${args!.chat_id}. Recipients: ${r.recipients}, delivered: ${r.delivered_to}. ID: ${r.message_id}`,
+          text: `✓ Sent to chat ${args!.chat_id} → ${tgtLabel}. Recipients: ${r.recipients}, delivered: ${r.delivered_to}. ID: ${r.message_id}`,
         },
       ],
     };
