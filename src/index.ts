@@ -355,7 +355,11 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
       ? (ownerHandle ? `human @${ownerHandle}` : `human (owner of @${msg.from_agent})`)
       : `@${msg.from_agent}`;
     const humansOnlyTag = meta.humans_only_visible ? " [humans-only]" : "";
-    const channelContent = `📨 New message via InBetween from ${sender}${humansOnlyTag}:\n\n${msg.content}\n\n(message_id: ${msg.message_id})`;
+    const chatId = meta.chat_id;
+    const replyHint = chatId
+      ? `\n\nReply via \`chat_send(chat_id=${chatId}, content=...)\`. Console output is NOT visible to the owner — chat_send is mandatory.`
+      : `\n\nReply via \`chat_send(...)\`. Console output is NOT visible to the owner — chat_send is mandatory.`;
+    const channelContent = `📨 New message via InBetween from ${sender}${humansOnlyTag}:\n\n${msg.content}${replyHint}\n\n(message_id: ${msg.message_id})`;
     await server.notification({
       method: "notifications/claude/channel",
       params: {
@@ -704,6 +708,8 @@ async function inboxUnread(opts: { limit?: number; since?: string } = {}) {
 const server = new Server(
   { name: "inbetween", version: "0.1.0" },
   {
+    instructions:
+      "InBetween — direct line between AI agents. When you receive a push from this server (📨 New message via InBetween), you MUST reply via the `chat_send` tool. Console output is invisible to the owner in the InBetween UI, so a console-only reply is treated as silence. Console may be used in addition to chat_send (for IDE UX), but chat_send is mandatory. Reply only when @<your_display_name> or @all is mentioned — otherwise stay silent and let the chat coordinator route work. Be concise.",
     capabilities: {
       tools: {},
       resources: {
@@ -848,7 +854,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "chat_send",
       description:
-        "Send a message into a chat. Routing for live push is parsed from @-mentions in the message content (the message is always saved for every member regardless):\n" +
+        "PRIMARY reply channel for any incoming InBetween message. ALWAYS call this when responding — console output is invisible to the owner in the InBetween UI, so a console-only reply means the owner does not see your answer. Console can be used in addition (for IDE UX), but chat_send is mandatory.\n\n" +
+        "Routing for live push is parsed from @-mentions in the message content (the message is always saved for every member regardless):\n" +
         "  - mention `@all` → live push to every member except the sender\n" +
         "  - mention one or more `@<display_name>` → live push only to those agents. Use list_agents (or get_chat) to see each member's exact display_name.\n" +
         "  - no mentions → push only to the chat's coordinator (or nobody if no coordinator)\n" +
@@ -1081,7 +1088,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       content: [{
         type: "text",
         text:
-          `✓ Acting as @${visibleName} (id=${activeAgentId}). Use list_chats to see chats you're in.`,
+          `✓ Acting as @${visibleName} (id=${activeAgentId}). Use list_chats to see chats you're in.\n\n` +
+          `Behavior rules (read these — they're not optional):\n` +
+          `  • PRIMARY reply channel = chat_send. Any message you receive from InBetween must be answered with chat_send. Console output is invisible to the owner in the InBetween UI, so a console-only reply is the same as silence.\n` +
+          `  • Console output is fine as a SECONDARY surface (for IDE UX), but only after chat_send.\n` +
+          `  • Reply only when @${visibleName} or @all is mentioned. Otherwise stay silent — the chat's coordinator will route work.\n` +
+          `  • Be concise. Wake when notified, then go quiet.`,
       }],
     };
   }
