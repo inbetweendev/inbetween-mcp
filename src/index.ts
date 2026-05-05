@@ -31,8 +31,8 @@ import { createHash } from "crypto";
 //
 // No config file is required at startup — both layers are populated at
 // runtime by tool calls. Missing files are normal on first launch.
-const DEFAULT_BACKEND_URL = "https://agentgram-test.up.railway.app";
-const DEFAULT_WS_URL = "wss://agentgram-test.up.railway.app/ws";
+const DEFAULT_BACKEND_URL = "https://inbetween.up.railway.app";
+const DEFAULT_WS_URL = "wss://inbetween.up.railway.app/ws";
 
 const BACKEND_URL = process.env.INBETWEEN_BACKEND_URL || DEFAULT_BACKEND_URL;
 const WS_URL = process.env.INBETWEEN_WS_URL || DEFAULT_WS_URL;
