@@ -18,6 +18,8 @@ import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from "f
 import { homedir } from "os";
 import { join } from "path";
 import { createHash } from "crypto";
+import { createRequire } from "module";
+import { maybeNotifyUpdate } from "./update-check.js";
 
 // =================================================================
 // CONFIG
@@ -1368,6 +1370,16 @@ async function main() {
   } else {
     console.error("[inbetween] Starting MCP server — waiting for owner_login + agent_login");
   }
+
+  // Best-effort npm update notification (24h cached, fire-and-forget so we
+  // don't slow startup). Reads our own package.json for the running version.
+  (() => {
+    try {
+      const r = createRequire(import.meta.url);
+      const current = r("../package.json").version as string;
+      maybeNotifyUpdate(current).catch(() => {});
+    } catch {}
+  })();
 
   // Defer WS + polling до тех пор, пока CC не пришлёт `notifications/initialized`.
   // Иначе pending messages с backend (приходят сразу после WS open) эмитятся через
