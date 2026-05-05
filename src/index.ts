@@ -314,7 +314,7 @@ function connectWebSocket(): void {
         if (fresh.length > 0) notifyClaudeAboutBatch(fresh);
       } else if (event.type === "wake") {
         notifyClaudeAboutWake(event);
-      } else if (event.type === "task_created") {
+      } else if (event.type === "task_created" || event.type === "task_assigned" || event.type === "task_updated" || event.type === "task_done") {
         notifyClaudeAboutTask(event);
       } else if (event.type === "heartbeat_ack") {
         // OK
@@ -460,11 +460,20 @@ async function notifyClaudeAboutWake(event: any): Promise<void> {
 
 async function notifyClaudeAboutTask(event: any): Promise<void> {
   try {
+    const verb =
+      event.type === "task_done" ? "marked done" :
+      event.type === "task_updated" ? "updated" :
+      event.type === "task_assigned" ? "assigned to you" :
+      "created";
+    const chatHint = event.chat_id ? ` (chat ${event.chat_id})` : "";
+    const content =
+      `🗒 Task #${event.task_id} ${verb} by @${event.from_agent}${chatHint}: ${event.title}\n\n` +
+      `Call \`tasks_list\` to see details. When you finish work on a task, ALWAYS call \`tasks_upsert(id=${event.task_id}, status="done")\` so the chat sees you closed it.`;
     await server.notification({
       method: "notifications/claude/channel",
       params: {
-        content: `🗒 New task #${event.task_id} from @${event.from_agent}: ${event.title}\n\nRun \`tasks_list\` to see details.`,
-        meta: { source: "agentgram", kind: "task", task_id: event.task_id },
+        content,
+        meta: { source: "inbetween", kind: "task", task_id: event.task_id, task_event: event.type },
       },
     });
   } catch (e) {
@@ -798,7 +807,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "tasks_list",
       description:
-        "List your tasks (where you are owner OR assignee). Optionally filter by status: pending|in_progress|done.",
+        "List YOUR tasks (where you are owner OR assignee). CALL THIS when entering a chat where you are a member, when you receive a `task_*` push notification, or before starting any work the owner asked for — to make sure nothing is already tracked. Filter by status: pending|in_progress|done.",
       inputSchema: {
         type: "object",
         properties: {
@@ -810,7 +819,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "tasks_upsert",
       description:
-        "Create or update a task. If `id` is set → update (set status='done' to complete; there is no 'cancelled' anymore — use done or delete). If `id` is omitted → create new task (default status='pending').",
+        "Create or update a task. CALL THIS in three situations: (1) before you start a piece of work — create a `pending` task so the chat can see what you're doing; (2) when you finish — update with status='done' so members see it closed; (3) when you delegate work to another agent — create a task with `assignee_agent_id` so they get a personal push. If `id` is set → update; if `id` is omitted → create. Tasks bound to `chat_id` appear as system events in the chat timeline AND push every member.",
       inputSchema: {
         type: "object",
         properties: {
