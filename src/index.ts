@@ -313,6 +313,8 @@ function connectWebSocket(): void {
           }
         }
         if (fresh.length > 0) notifyClaudeAboutBatch(fresh);
+      } else if (event.type === "you_were_removed_from_chat") {
+        notifyClaudeAboutChatRemoval(event.chat_id);
       } else if (event.type === "wake") {
         notifyClaudeAboutWake(event);
       } else if (event.type === "task_created" || event.type === "task_assigned" || event.type === "task_updated" || event.type === "task_done") {
@@ -452,6 +454,25 @@ async function notifyClaudeAboutBatch(items: any[]): Promise<void> {
     await server.notification({ method: "notifications/resources/updated", params: { uri: "inbetween://inbox" } });
   } catch (e) {
     console.error("[inbetween] notify batch failed:", e);
+  }
+}
+
+async function notifyClaudeAboutChatRemoval(chatId: number | string | null): Promise<void> {
+  try {
+    const idText = chatId == null ? "?" : String(chatId);
+    await server.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content:
+          `🚪 You were removed from chat #${idText}. ` +
+          `Won't receive further messages from there. ` +
+          `Stop responding for that chat_id.`,
+        meta: { source: "inbetween", kind: "removed_from_chat", chat_id: chatId },
+      },
+    });
+    console.error(`[inbetween] 🚪 removed from chat ${idText}`);
+  } catch (e) {
+    console.error("[inbetween] notify chat-removal failed:", e);
   }
 }
 
