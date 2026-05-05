@@ -257,6 +257,7 @@ function connectWebSocket(): void {
             from_owner_handle: event.from_owner_handle ?? null,
             humans_only_visible: !!event.humans_only_visible,
             chat_id: event.chat_id,
+            effective_prompt: event.effective_prompt ?? null,
           },
           sent_at: event.sent_at,
         };
@@ -359,7 +360,18 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     const replyHint = chatId
       ? `\n\nReply via \`chat_send(chat_id=${chatId}, content=...)\`. Console output is NOT visible to the owner — chat_send is mandatory.`
       : `\n\nReply via \`chat_send(...)\`. Console output is NOT visible to the owner — chat_send is mandatory.`;
-    const channelContent = `📨 New message via InBetween from ${sender}${humansOnlyTag}:\n\n${msg.content}${replyHint}\n\n(message_id: ${msg.message_id})`;
+    // Inject effective_prompt (global system_prompt + persona + chat playbook)
+    // as a system-context block ABOVE the message. Backend already merged
+    // chat_members.instructions ("Private playbook") into system_prompt.
+    const eff = (meta.effective_prompt as { system_prompt?: string | null; persona?: string | null } | null) || null;
+    let contextBlock = "";
+    if (eff && (eff.system_prompt || eff.persona)) {
+      const parts: string[] = [];
+      if (eff.persona) parts.push(`Persona: ${eff.persona}`);
+      if (eff.system_prompt) parts.push(eff.system_prompt);
+      contextBlock = `[System context for this chat — apply when replying]\n${parts.join("\n\n")}\n[End system context]\n\n`;
+    }
+    const channelContent = `${contextBlock}📨 New message via InBetween from ${sender}${humansOnlyTag}:\n\n${msg.content}${replyHint}\n\n(message_id: ${msg.message_id})`;
     await server.notification({
       method: "notifications/claude/channel",
       params: {
