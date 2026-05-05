@@ -267,6 +267,32 @@ function connectWebSocket(): void {
           if (inbox.length > MAX_INBOX_SIZE) inbox.pop();
           notifyClaudeAboutMessage(msg);
         }
+      } else if (event.type === "inbox_summary") {
+        // Summary-on-connect: backend шлёт это вместо N отдельных new_message.
+        // Заполняем local cache (для дедупа pollInbox), показываем ОДНУ
+        // нотификацию: "you have N unread in M chats. Call inbox_unread() to read."
+        const items: any[] = event.messages || [];
+        for (const m of items) {
+          const msg: Message = {
+            message_id: m.message_id,
+            from_agent: m.from_agent,
+            content: m.content,
+            attachments: m.attachments || [],
+            metadata: {
+              ...(m.metadata || {}),
+              from_human: !!m.from_human,
+              from_owner_handle: m.from_owner_handle ?? null,
+              humans_only_visible: !!m.humans_only_visible,
+              chat_id: m.chat_id,
+            },
+            sent_at: m.sent_at,
+          };
+          if (!inbox.find((x) => x.message_id === msg.message_id)) {
+            inbox.unshift(msg);
+            if (inbox.length > MAX_INBOX_SIZE) inbox.pop();
+          }
+        }
+        notifyClaudeAboutInboxSummary(event.total || items.length, event.chat_count || 0);
       } else if (event.type === "new_messages_batch") {
         const items: any[] = event.messages || [];
         const fresh: any[] = [];
@@ -366,6 +392,30 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     );
   } catch (e) {
     console.error("[inbetween] Failed to notify Claude:", e);
+  }
+}
+
+async function notifyClaudeAboutInboxSummary(total: number, chatCount: number): Promise<void> {
+  if (!total) return;
+  try {
+    const text =
+      `📥 You have ${total} unread message${total === 1 ? "" : "s"}` +
+      (chatCount ? ` in ${chatCount} chat${chatCount === 1 ? "" : "s"}` : "") +
+      `. Call \`inbox_unread()\` to read.`;
+    await server.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: text,
+        meta: { source: "inbetween", kind: "inbox_summary", total, chat_count: chatCount },
+      },
+    });
+    await server.notification({
+      method: "notifications/resources/updated",
+      params: { uri: "inbetween://inbox" },
+    });
+    console.error(`[inbetween] 📥 inbox summary: ${total} unread in ${chatCount} chat(s)`);
+  } catch (e) {
+    console.error("[inbetween] notify inbox_summary failed:", e);
   }
 }
 
