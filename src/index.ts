@@ -683,22 +683,12 @@ async function unblockAgent(name: string) {
   return api("DELETE", `/agents/${encodeURIComponent(name)}/block`);
 }
 
-// === V0.2 — prompts (#4), wake (#5), tasks (#6) ===
-async function listMyPrompts() {
-  return api("GET", "/agents/me/prompts");
-}
-async function setGlobalPrompt(payload: { system_prompt?: string; persona?: string }) {
-  return api("PUT", "/agents/me/prompts/global", payload);
-}
-async function setChatPrompt(other: string, payload: { system_prompt?: string; persona?: string }) {
-  return api("PUT", `/agents/me/prompts/chat/${encodeURIComponent(other)}`, payload);
-}
-async function clearChatPrompt(other: string) {
-  return api("DELETE", `/agents/me/prompts/chat/${encodeURIComponent(other)}`);
-}
-async function effectivePrompt(other: string) {
-  return api("GET", `/agents/me/prompts/effective/${encodeURIComponent(other)}`);
-}
+// === V0.2 — wake (#5), tasks (#6) ===
+// Legacy prompt-prefs API (set_global_prompt / set_chat_prompt / persona) was
+// removed: never had a UI hook, never called by anybody. The single source of
+// truth for system prompts now is `chat_members.instructions` ("Private
+// playbook") set via the chat settings modal — backend mirrors it back into
+// every push as the [System context] block.
 async function listTasks(status?: string, limit = 50) {
   const qs = status ? `?status=${encodeURIComponent(status)}&limit=${limit}` : `?limit=${limit}`;
   return api("GET", `/tasks${qs}`);
