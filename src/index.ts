@@ -453,6 +453,24 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     const replyHint = chatId
       ? `\n\nReply via \`chat_send(chat_id=${chatId}, content=...)\`. Console output is NOT visible to the owner — chat_send is mandatory.`
       : `\n\nReply via \`chat_send(...)\`. Console output is NOT visible to the owner — chat_send is mandatory.`;
+    // Attachment summary — owner explicitly asked agents NOT to guess.
+    // We tell them: there are N files, here are name/size/mime, fetch via
+    // attachment_download. We deliberately do NOT embed the signed URL —
+    // it would leak into stdio buffers / cached transcripts. The tool
+    // generates a fresh URL each call.
+    const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+    let attachmentBlock = "";
+    if (attachments.length > 0) {
+      const lines = attachments.map((a: any, i: number) => {
+        const sizeKB = a.size ? `${Math.round(a.size / 1024)} KB` : "unknown size";
+        const mime = a.mime || a.content_type || "application/octet-stream";
+        return `  ${i}: ${a.name || "(unnamed)"} (${sizeKB}, ${mime})`;
+      });
+      attachmentBlock =
+        `\n\n📎 ${attachments.length} attachment${attachments.length > 1 ? "s" : ""}:\n` +
+        lines.join("\n") +
+        `\n(call \`attachment_download(message_id="${msg.message_id}", index=N)\` to fetch any of them — returns a fresh signed URL with a 10-minute TTL)`;
+    }
     // Inject effective_prompt (global system_prompt + persona + chat playbook)
     // as a system-context block ABOVE the message. Backend already merged
     // chat_members.instructions ("Private playbook") into system_prompt.
@@ -473,7 +491,7 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     const contextBlock = parts.length
       ? `[System context for this chat — apply when replying]\n${parts.join("\n\n")}\n[End system context]\n\n`
       : "";
-    const channelContent = `${contextBlock}📨 New message via InBetween from ${sender}${humansOnlyTag}:\n\n${msg.content}${replyHint}\n\n(message_id: ${msg.message_id})`;
+    const channelContent = `${contextBlock}📨 New message via InBetween from ${sender}${humansOnlyTag}:\n\n${msg.content}${attachmentBlock}${replyHint}\n\n(message_id: ${msg.message_id})`;
     await server.notification({
       method: "notifications/claude/channel",
       params: {
@@ -855,7 +873,8 @@ const server = new Server(
   { name: "inbetween", version: "0.1.0" },
   {
     instructions:
-      "InBetween — direct line between AI agents. When you receive a push from this server (📨 New message via InBetween), you MUST reply via the `chat_send` tool. Console output is invisible to the owner in the InBetween UI, so a console-only reply is treated as silence. Console may be used in addition to chat_send (for IDE UX), but chat_send is mandatory. Reply only when @<your_display_name> or @all is mentioned — otherwise stay silent and let the chat coordinator route work. Be concise.",
+      "InBetween — direct line between AI agents. When you receive a push from this server (📨 New message via InBetween), you MUST reply via the `chat_send` tool. Console output is invisible to the owner in the InBetween UI, so a console-only reply is treated as silence. Console may be used in addition to chat_send (for IDE UX), but chat_send is mandatory. Reply only when @<your_display_name> or @all is mentioned — otherwise stay silent and let the chat coordinator route work. Be concise. " +
+      "Files: pushes that include a `📎 N attachments:` section carry files. Use `attachment_download(message_id, index)` to fetch a fresh signed URL (10-min TTL), then WebFetch it to read the bytes. To send a file yourself, use `attachment_send(chat_id, content, local_path)` — it uploads + posts the message in one atomic call (≤25MB, common image/text/pdf/json MIME types).",
     capabilities: {
       tools: {},
       resources: {
@@ -1005,15 +1024,46 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "  - mention `@all` → live push to every member except the sender\n" +
         "  - mention one or more `@<display_name>` → live push only to those agents. Use list_agents (or get_chat) to see each member's exact display_name.\n" +
         "  - no mentions → push only to the chat's coordinator (or nobody if no coordinator)\n" +
-        "Use `@all` for announcements. Use specific `@<display_name>` mentions to delegate work. Omit mentions to let the coordinator triage.",
+        "Use `@all` for announcements. Use specific `@<display_name>` mentions to delegate work. Omit mentions to let the coordinator triage.\n\n" +
+        "**Files:** to send a file along with the message, use `attachment_send` instead — it uploads the file from disk and posts the message in one call. The plain `chat_send` is text-only.",
       inputSchema: {
         type: "object",
         properties: {
           chat_id: { type: "string", description: "Chat id (from list_chats)" },
           content: { type: "string", description: "Message text. Include @<display_name> or @all to control routing." },
-          attachments: { type: "array", items: { type: "object" } },
+          attachments: { type: "array", items: { type: "object" }, description: "Pre-uploaded attachment objects (rare — usually you should call `attachment_send` instead which handles upload + send atomically)." },
         },
         required: ["chat_id", "content"],
+      },
+    },
+    // ===== Attachments =====
+    {
+      name: "attachment_download",
+      description:
+        "Download an attachment from a message you've received. When a push arrives with a `📎 N attachments:` block, this tool fetches a fresh signed URL (TTL 10 min) for the file you want. Use the returned `download_url` with WebFetch (or any HTTP client) to grab the bytes — it's a regular Supabase-Storage signed URL, no auth header needed during the TTL window. The file lives in a private bucket gated by RLS — only chat members can sign for it.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          message_id: { type: "string", description: "message_id from the push or from chat_messages" },
+          index: { type: "number", default: 0, description: "Which attachment in the message (0 = first). Most messages carry exactly one." },
+        },
+        required: ["message_id"],
+      },
+    },
+    {
+      name: "attachment_send",
+      description:
+        "Upload a local file AND post a chat message with it attached, atomically in a single call. Use this whenever you want to share an artifact (screenshot, log file, generated PDF, JSON dump, etc.) — saves you the dance of separately uploading and then attaching. Limits: ≤25MB; allowed MIME types are image/png|jpeg|webp|gif, application/pdf|json|octet-stream, text/plain|markdown. Storage is a private bucket — only members of the target chat can fetch what you upload.\n\n" +
+        "Routing rules for the message text are the same as `chat_send`: include `@<display_name>` mentions to wake specific agents, `@all` for everyone, no mention = coordinator triages.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "Chat id (from list_chats)" },
+          content: { type: "string", description: "Message text accompanying the attachment. May contain @-mentions." },
+          local_path: { type: "string", description: "Absolute or cwd-relative path to the file on disk you want to send." },
+          name: { type: "string", description: "Optional override for the visible file name (defaults to the basename of local_path)." },
+        },
+        required: ["chat_id", "content", "local_path"],
       },
     },
     {
@@ -1355,6 +1405,127 @@ ${JSON.stringify(r, null, 2)}` }] };
           text: `✓ Sent to chat ${args!.chat_id}. Recipients: ${r.recipients}, delivered: ${r.delivered_to}. ID: ${r.message_id}`,
         },
       ],
+    };
+  }
+  if (name === "attachment_download") {
+    const messageId = args!.message_id as string;
+    const index = (args?.index as number | undefined) ?? 0;
+    // Find the message in the local inbox cache (populated by WS pushes
+    // and the boot inbox_summary). Fall back to a backend round-trip if
+    // it's not cached locally.
+    let msg = inbox.find((m) => m.message_id === messageId);
+    if (!msg) {
+      // Pull recent inbox slice fresh from backend.
+      try {
+        const fresh = await api<any>("GET", "/inbox?limit=200");
+        const items: any[] = fresh?.messages || [];
+        msg = items.find((m: any) => m.message_id === messageId);
+      } catch (_) { /* fall through */ }
+    }
+    if (!msg) {
+      return { content: [{ type: "text", text: `✗ message_id=${messageId} not found in your visible inbox` }], isError: true };
+    }
+    const atts = Array.isArray(msg.attachments) ? msg.attachments : [];
+    const att = atts[index];
+    if (!att) {
+      return { content: [{ type: "text", text: `✗ attachment index=${index} not found (message has ${atts.length} attachment(s))` }], isError: true };
+    }
+    const path = att.path as string;
+    const bucket = (att.bucket as string) || "chat-attachments";
+    if (!path) {
+      return { content: [{ type: "text", text: `✗ attachment object has no \`path\` — looks malformed: ${JSON.stringify(att)}` }], isError: true };
+    }
+    let signed: any;
+    try {
+      signed = await api<any>("POST", "/attachments/download-url", { path, bucket });
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `✗ download-url request failed: ${e?.message || e}` }], isError: true };
+    }
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          name: att.name ?? null,
+          size: att.size ?? null,
+          mime: att.mime ?? att.content_type ?? null,
+          download_url: signed.url,
+          expires_in_seconds: 600,
+          hint: "Use WebFetch (or any HTTP client) on download_url within 10 minutes. The URL is single-use-friendly but you can call attachment_download again to refresh.",
+        }, null, 2),
+      }],
+    };
+  }
+  if (name === "attachment_send") {
+    const chatId = args!.chat_id as string;
+    const content = args!.content as string;
+    const localPath = args!.local_path as string;
+    const overrideName = args?.name as string | undefined;
+    // Lazy import to avoid module-level overhead.
+    const fs = await import("fs");
+    const pathLib = await import("path");
+    let stat: any;
+    try {
+      stat = fs.statSync(localPath);
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `✗ local_path not readable: ${e?.message || e}` }], isError: true };
+    }
+    if (!stat.isFile()) {
+      return { content: [{ type: "text", text: `✗ local_path is not a regular file` }], isError: true };
+    }
+    const size = stat.size;
+    if (size > 25 * 1024 * 1024) {
+      return { content: [{ type: "text", text: `✗ file too large (${size} bytes); cap is 25MB` }], isError: true };
+    }
+    const fileName = overrideName || pathLib.basename(localPath);
+    const ext = pathLib.extname(fileName).toLowerCase();
+    const mimeMap: Record<string, string> = {
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".webp": "image/webp",
+      ".gif": "image/gif",
+      ".pdf": "application/pdf",
+      ".txt": "text/plain",
+      ".log": "text/plain",
+      ".md": "text/markdown",
+      ".json": "application/json",
+    };
+    const mime = mimeMap[ext] || "application/octet-stream";
+    // 1. Sign upload — returns { upload_url, path, bucket, ... }
+    let sig: any;
+    try {
+      sig = await api<any>("POST", "/attachments/sign", {
+        filename: fileName,
+        content_type: mime,
+        size,
+        chat_id: Number(chatId),
+      });
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `✗ sign failed: ${e?.message || e}` }], isError: true };
+    }
+    // 2. PUT bytes to signed URL.
+    const buf = fs.readFileSync(localPath);
+    const putRes = await fetch(sig.upload_url, {
+      method: "PUT",
+      headers: { "Content-Type": mime },
+      body: buf,
+    });
+    if (!putRes.ok) {
+      return { content: [{ type: "text", text: `✗ upload PUT failed: ${putRes.status} ${await putRes.text()}` }], isError: true };
+    }
+    // 3. chat_send with attachment.
+    const att = { path: sig.path, bucket: sig.bucket, mime, size, name: fileName };
+    let send: any;
+    try {
+      send = await chatSend(chatId, content, [att], {});
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `✗ uploaded ok but chat_send failed: ${e?.message || e}` }], isError: true };
+    }
+    return {
+      content: [{
+        type: "text",
+        text: `✓ Uploaded ${fileName} (${Math.round(size / 1024)} KB, ${mime}) and sent to chat ${chatId}. Recipients: ${send.recipients}, delivered: ${send.delivered_to}. message_id: ${send.message_id}`,
+      }],
     };
   }
   if (name === "search_messages") {
