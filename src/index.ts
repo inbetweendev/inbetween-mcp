@@ -962,7 +962,8 @@ const server = new Server(
       "1. ALWAYS reply via the `chat_send` tool. The InBetween chat is the only surface the owner sees — console output is invisible to them, so a console-only reply is silence. Console is fine as a SECONDARY surface for IDE UX, but chat_send is mandatory and must come first.\n" +
       "2. Reply only when @<your_display_name> or @all is mentioned in the message. Otherwise stay silent — the chat coordinator routes work.\n" +
       "3. Be concise. Wake on push, send one chat_send, go quiet.\n" +
-      "4. Files in pushes appear as a `📎 N attachments:` block — call `attachment_download(message_id, index)` for a fresh 10-min signed URL, then WebFetch the bytes. To send a file yourself use `attachment_send(chat_id, content, local_path)` (uploads + posts atomically; ≤25MB; image/png|jpeg|webp|gif, application/pdf|json, text/plain|markdown).",
+      "4. Track work via tasks. BEFORE starting any non-trivial work, call `tasks_upsert(title=..., status=\"pending\", chat_id=<chat>)` so members see what you're doing. WHEN you finish, call `tasks_upsert(id=..., status=\"done\")`. WHEN you delegate to another agent, call `tasks_upsert(title=..., assignee_agent_id=<their id>, chat_id=<chat>)` BEFORE @-mentioning them — they get a personal push and a tracked task. ON entering a chat or after restart, call `tasks_list` to see what's already tracked. Coordinators delegate often; this is mandatory for them.\n" +
+      "5. Files in pushes appear as a `📎 N attachments:` block — call `attachment_download(message_id, index)` for a fresh 10-min signed URL, then WebFetch the bytes. To send a file yourself use `attachment_send(chat_id, content, local_path)` (uploads + posts atomically; ≤25MB; image/png|jpeg|webp|gif, application/pdf|json, text/plain|markdown).",
     capabilities: {
       tools: {},
       resources: {
@@ -1402,7 +1403,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           `  1. Every reply to an InBetween push goes through \`chat_send\` first. The console is invisible to the owner; a console-only reply = silence on their side.\n` +
           `  2. Reply only when @${visibleName} or @all is in the message. No mention → stay silent (coordinator routes work).\n` +
           `  3. Be concise. One chat_send per push, then go quiet.\n` +
-          `  4. Console may follow chat_send for IDE UX, but never replace it.`,
+          `  4. Track work via tasks. BEFORE non-trivial work — \`tasks_upsert(title=..., status="pending", chat_id=<chat>)\`. ON finish — \`tasks_upsert(id=..., status="done")\`. WHEN delegating — \`tasks_upsert(assignee_agent_id=<id>, chat_id=<chat>)\` BEFORE @-mentioning them. ON entering a chat — \`tasks_list\` to see what's already tracked. Silent work is invisible work.\n` +
+          `  5. Console may follow chat_send for IDE UX, but never replace it.`,
       }],
     };
   }
