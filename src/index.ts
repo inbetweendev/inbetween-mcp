@@ -336,11 +336,21 @@ function connectWebSocket(): void {
   });
 
   ws.on("close", (code, reason) => {
-    console.error(`[inbetween] WS CLOSE code=${code} reason=${reason?.toString() || "?"}; reconnect in 3s`);
-    if (code === 4002) {
-      console.error("[inbetween] superseded by another login → not reconnecting (this session is stale)");
+    console.error(`[inbetween] WS CLOSE code=${code} reason=${reason?.toString() || "?"}`);
+    // Terminal close codes — DON'T reconnect. Otherwise we hammer the
+    // backend every 3s with a dead token and create a 403-storm in logs.
+    //   4001 — auth failed (token revoked / agent deleted / bad token)
+    //   4002 — superseded by another login for this session
+    //   4029 — concurrent-session cap reached for this agent_id
+    if (code === 4001 || code === 4002 || code === 4029) {
+      activeAgentToken = null;
+      console.error(
+        `[inbetween] terminal close (${code}) — not reconnecting. ` +
+        `Run \`agent_login\` again with a fresh token, or restart the IDE.`,
+      );
       return;
     }
+    console.error("[inbetween] reconnect in 3s");
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connectWebSocket, 3000);
   });
