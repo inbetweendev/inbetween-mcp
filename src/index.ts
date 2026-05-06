@@ -23,31 +23,50 @@ import { join } from "path";
 // ~/.inbetween/mcp.log so the owner can read it WITHOUT terminal stunts
 // (Claude Code launches MCP in a place where stderr is invisible by
 // default). Best-effort: a log write failure must NEVER kill the server.
+// FILE LOGGING — DISABLED by default. Enable with INBETWEEN_DEBUG=1 to write
+// a verbose trace to ~/.inbetween/mcp.log (used during incident triage).
+// Without DEBUG: log file is never created, console.error still goes to
+// stderr (visible if the user runs MCP outside Claude/Codex).
 // =================================================================
+const DEBUG = process.env.INBETWEEN_DEBUG === "1";
 const LOG_FILE = join(homedir(), ".inbetween", "mcp.log");
+const LOG_MAX_BYTES = 256 * 1024; // 256KB cap — rotate to .log.1 then drop
 try {
-  mkdirSync(join(homedir(), ".inbetween"), { recursive: true });
+  if (DEBUG) mkdirSync(join(homedir(), ".inbetween"), { recursive: true });
 } catch {}
-function logLine(level: string, msg: string): void {
+function rotateIfNeeded(): void {
+  if (!DEBUG) return;
   try {
+    const stat = require("fs").statSync(LOG_FILE);
+    if (stat.size >= LOG_MAX_BYTES) {
+      try { require("fs").renameSync(LOG_FILE, LOG_FILE + ".1"); } catch {}
+    }
+  } catch { /* file may not exist yet */ }
+}
+function logLine(level: string, msg: string): void {
+  if (!DEBUG) return;
+  try {
+    rotateIfNeeded();
     const line = `[${new Date().toISOString()}] [${level}] ${msg}\n`;
     appendFileSync(LOG_FILE, line);
   } catch {
     /* swallow — logging must never crash the process */
   }
 }
-// Wrap console.error so all existing call sites get mirrored into the file.
+// Wrap console.error: file mirroring only when DEBUG, stderr always.
 const _origConsoleError = console.error.bind(console);
 console.error = (...args: any[]) => {
-  try {
-    const text = args
-      .map((a) => (a instanceof Error ? `${a.message}\n${a.stack ?? ""}` : typeof a === "string" ? a : JSON.stringify(a)))
-      .join(" ");
-    logLine("err", text);
-  } catch {}
+  if (DEBUG) {
+    try {
+      const text = args
+        .map((a) => (a instanceof Error ? `${a.message}\n${a.stack ?? ""}` : typeof a === "string" ? a : JSON.stringify(a)))
+        .join(" ");
+      logLine("err", text);
+    } catch {}
+  }
   _origConsoleError(...args);
 };
-logLine("inf", `=== MCP boot pid=${process.pid} cwd=${process.cwd()} ===`);
+if (DEBUG) logLine("inf", `=== MCP boot pid=${process.pid} cwd=${process.cwd()} ===`);
 import { createHash } from "crypto";
 import { createRequire } from "module";
 import { maybeNotifyUpdate } from "./update-check.js";
@@ -152,6 +171,21 @@ process.on("SIGTERM", () => { cleanupProcessSessionFile(); process.exit(0); });
 // kills the process on unhandled rejection — which surfaces in Claude Code as
 // "MCP server disconnected — all tools return 'Not connected'". The
 // individual handlers already have inner try/catch; this is the safety net.
+// Parent death watchdog. On Windows when Claude Code closes a window, the
+// parent process can die without sending SIGTERM, leaving our subprocess
+// orphaned with a half-closed pipe. Listen for stdin EOF — that means the
+// parent (Claude) has closed our input pipe → it's gone → we should exit.
+process.stdin.on("end", () => {
+  console.error("[inbetween] stdin closed — parent gone, exiting");
+  try { cleanupProcessSessionFile(); } catch {}
+  process.exit(0);
+});
+process.stdin.on("close", () => {
+  console.error("[inbetween] stdin closed — parent gone, exiting");
+  try { cleanupProcessSessionFile(); } catch {}
+  process.exit(0);
+});
+
 // Guard flag — once the parent pipe is dead, additional writes only burn
 // CPU and flood the log. Set on first EPIPE so logger() short-circuits.
 let transportDead = false;
@@ -194,15 +228,16 @@ process.on("uncaughtException", (err: any) => {
   }
   console.error("[inbetween] uncaughtException (suppressed):", err?.message ?? err);
 });
-// Heartbeat — log once a minute so we can tell if the process is alive when
-// the user reports tool calls returning "Not connected" but no fresh logs.
-setInterval(() => {
-  console.error(`[inbetween] heartbeat pid=${process.pid} uptime=${process.uptime().toFixed(0)}s`);
-}, 60_000).unref();
-// On any flavour of process death, leave a final breadcrumb in the log so we
-// can tell whether MCP died vs the transport got severed.
-process.on("beforeExit", (code) => console.error(`[inbetween] beforeExit code=${code}`));
-process.on("exit", (code) => console.error(`[inbetween] exit code=${code}`));
+// Heartbeat — only when INBETWEEN_DEBUG=1. In production this generates
+// stderr noise that funnels through Claude's logger and contributes to
+// stdio pipe pressure under no real benefit to the user.
+if (DEBUG) {
+  setInterval(() => {
+    console.error(`[inbetween] heartbeat pid=${process.pid} uptime=${process.uptime().toFixed(0)}s`);
+  }, 60_000).unref();
+  process.on("beforeExit", (code) => console.error(`[inbetween] beforeExit code=${code}`));
+  process.on("exit", (code) => console.error(`[inbetween] exit code=${code}`));
+}
 
 // =================================================================
 // OWNER-LEVEL SESSION (Layer 0) — `~/.inbetween/owner.json`
