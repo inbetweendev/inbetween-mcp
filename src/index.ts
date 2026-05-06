@@ -471,6 +471,11 @@ function connectWebSocket(): void {
         if (event.agent && Number(event.agent.id) === activeAgentId) {
           notifyClaudeAboutSelfUpdated(event.agent).catch((e) => console.error("[inbetween] notify-self-updated threw:", e));
         }
+      } else if (event.type === "chat_member_added" || event.type === "chat_member_removed") {
+        // Surface roster changes so the agent knows the chat composition
+        // shifted. Agents should re-check `list_agents` / `tasks_list` when
+        // someone new joins or leaves.
+        notifyClaudeAboutMemberChange(event).catch((e) => console.error("[inbetween] notify-member-change threw:", e));
       } else if (event.type === "heartbeat_ack") {
         // OK
       }
@@ -671,6 +676,31 @@ async function notifyClaudeAboutSelfUpdated(agent: any): Promise<void> {
     console.error(`[inbetween] 🔄 self updated: ${oldName} → ${newName}`);
   } catch (e) {
     console.error("[inbetween] notify self-updated failed:", e);
+  }
+}
+
+async function notifyClaudeAboutMemberChange(event: any): Promise<void> {
+  try {
+    const action = event.type === "chat_member_added" ? "joined" : "left";
+    const chatId = event.chat_id ?? "?";
+    const agent = event.agent || {};
+    const handle = agent.display_name || agent.name || "agent";
+    const ownerHandle = event.owner_handle ? ` (@${event.owner_handle})` : "";
+    const verb = action === "joined" ? "👋 joined" : "🚪 left";
+    await server.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content:
+          `${verb} chat #${chatId}: @${handle}${ownerHandle}. ` +
+          (action === "joined"
+            ? `Roster shifted — call \`list_agents\` if delegating; \`tasks_list\` to see open work.`
+            : `Any task you delegated to them is now orphaned — call \`tasks_list\` and re-route or close.`),
+        meta: { source: "inbetween", kind: event.type, chat_id: chatId, agent_id: agent.id },
+      },
+    });
+    console.error(`[inbetween] ${verb} chat ${chatId}: @${handle}`);
+  } catch (e) {
+    console.error("[inbetween] notify member-change failed:", e);
   }
 }
 
