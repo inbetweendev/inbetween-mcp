@@ -436,8 +436,19 @@ function connectWebSocket(): void {
             if (inbox.length > MAX_INBOX_SIZE) inbox.pop();
           }
         }
-        notifyClaudeAboutInboxSummary(event.total || items.length, event.chat_count || 0)
+        // Fire once immediately. Then again 2 seconds later — Claude UI
+        // sometimes isn't ready to surface notifications/claude/channel
+        // pushes during the WS open handshake, especially right after a
+        // window restart. Two firings give the second one a much better
+        // chance of being rendered visibly.
+        const total = event.total || items.length;
+        const chatCount = event.chat_count || 0;
+        notifyClaudeAboutInboxSummary(total, chatCount)
           .catch((e) => console.error("[inbetween] notify-summary threw:", e));
+        setTimeout(() => {
+          notifyClaudeAboutInboxSummary(total, chatCount)
+            .catch((e) => console.error("[inbetween] notify-summary (retry) threw:", e));
+        }, 2000);
       } else if (event.type === "new_messages_batch") {
         const items: any[] = event.messages || [];
         const fresh: any[] = [];
@@ -612,12 +623,15 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
 }
 
 async function notifyClaudeAboutInboxSummary(total: number, chatCount: number): Promise<void> {
-  if (!total) return;
+  // Fire even when total=0. The "you're caught up" version reminds the
+  // agent on reconnect to check open tasks — silent reconnect = silent
+  // agent, which the owner reads as the system being broken.
   try {
-    const text =
-      `📥 You have ${total} unread message${total === 1 ? "" : "s"}` +
-      (chatCount ? ` in ${chatCount} chat${chatCount === 1 ? "" : "s"}` : "") +
-      `. Call \`inbox_unread()\` to read.`;
+    const text = total > 0
+      ? `📥 You have ${total} unread message${total === 1 ? "" : "s"}` +
+        (chatCount ? ` in ${chatCount} chat${chatCount === 1 ? "" : "s"}` : "") +
+        `. Call \`inbox_unread()\` to read, then handle each one via \`chat_send\`.`
+      : `✓ Connected. Inbox is clear. Call \`tasks_list\` to see open work — there may be tasks assigned to you that haven't been picked up yet.`;
     await server.notification({
       method: "notifications/claude/channel",
       params: {
