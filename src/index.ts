@@ -246,6 +246,13 @@ function connectWebSocket(): void {
         console.error(`[inbetween] WS recv type=${event.type} msg_id=${event.message_id || "-"} from=${event.from_agent || "-"}`);
       }
       if (event.type === "new_message") {
+        // Backend tells us the recipient's *current* display_name — keep
+        // local cache fresh so notifyClaudeAboutMessage can remind Claude
+        // of the up-to-date handle (covers the case where the owner
+        // renamed this agent after the onboarding prompt was pasted).
+        if (event.recipient_display_name) {
+          activeAgentName = event.recipient_display_name;
+        }
         const msg: Message = {
           message_id: event.message_id,
           from_agent: event.from_agent,
@@ -258,6 +265,7 @@ function connectWebSocket(): void {
             humans_only_visible: !!event.humans_only_visible,
             chat_id: event.chat_id,
             effective_prompt: event.effective_prompt ?? null,
+            recipient_display_name: event.recipient_display_name ?? null,
           },
           sent_at: event.sent_at,
         };
@@ -384,13 +392,22 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     // as a system-context block ABOVE the message. Backend already merged
     // chat_members.instructions ("Private playbook") into system_prompt.
     const eff = (meta.effective_prompt as { system_prompt?: string | null; persona?: string | null } | null) || null;
-    let contextBlock = "";
-    if (eff && (eff.system_prompt || eff.persona)) {
-      const parts: string[] = [];
-      if (eff.persona) parts.push(`Persona: ${eff.persona}`);
-      if (eff.system_prompt) parts.push(eff.system_prompt);
-      contextBlock = `[System context for this chat — apply when replying]\n${parts.join("\n\n")}\n[End system context]\n\n`;
+    // Always lead with the agent's *current* handle so behavior rules from
+    // the original onboarding prompt (which baked in the old name) get
+    // overridden if the owner has since renamed the agent.
+    const currentHandle = (meta.recipient_display_name as string | null | undefined) || activeAgentName;
+    const parts: string[] = [];
+    if (currentHandle) {
+      parts.push(
+        `Your current handle in this chat is @${currentHandle}. ` +
+        `Reply ONLY when @${currentHandle} or @all is mentioned, even if your original onboarding prompt referenced a different name (the owner may have renamed you).`,
+      );
     }
+    if (eff?.persona) parts.push(`Persona: ${eff.persona}`);
+    if (eff?.system_prompt) parts.push(eff.system_prompt);
+    const contextBlock = parts.length
+      ? `[System context for this chat — apply when replying]\n${parts.join("\n\n")}\n[End system context]\n\n`
+      : "";
     const channelContent = `${contextBlock}📨 New message via InBetween from ${sender}${humansOnlyTag}:\n\n${msg.content}${replyHint}\n\n(message_id: ${msg.message_id})`;
     await server.notification({
       method: "notifications/claude/channel",
