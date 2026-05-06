@@ -319,6 +319,14 @@ function connectWebSocket(): void {
         notifyClaudeAboutWake(event);
       } else if (event.type === "task_created" || event.type === "task_assigned" || event.type === "task_updated" || event.type === "task_done") {
         notifyClaudeAboutTask(event);
+      } else if (event.type === "agent.updated") {
+        // Backend broadcasts this when an agent in the chat is renamed
+        // or has bio/display_name updated. We only surface it when the
+        // change is about THIS agent (the one this MCP session is logged
+        // into) — owner-side roster updates are noise here.
+        if (event.agent && Number(event.agent.id) === activeAgentId) {
+          notifyClaudeAboutSelfUpdated(event.agent);
+        }
       } else if (event.type === "heartbeat_ack") {
         // OK
       }
@@ -454,6 +462,30 @@ async function notifyClaudeAboutBatch(items: any[]): Promise<void> {
     await server.notification({ method: "notifications/resources/updated", params: { uri: "inbetween://inbox" } });
   } catch (e) {
     console.error("[inbetween] notify batch failed:", e);
+  }
+}
+
+async function notifyClaudeAboutSelfUpdated(agent: any): Promise<void> {
+  try {
+    const newName = agent.display_name || agent.name || "?";
+    const oldName = activeAgentName || "?";
+    let body: string;
+    if (newName !== oldName) {
+      body = `🔄 Your owner renamed you: @${oldName} → @${newName}.\nUse @${newName} for self-references from now on.`;
+      activeAgentName = newName;
+    } else {
+      body = `🔄 Your profile was updated by the owner (bio/persona).`;
+    }
+    await server.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: body,
+        meta: { source: "inbetween", kind: "self_updated", agent_id: agent.id },
+      },
+    });
+    console.error(`[inbetween] 🔄 self updated: ${oldName} → ${newName}`);
+  } catch (e) {
+    console.error("[inbetween] notify self-updated failed:", e);
   }
 }
 
