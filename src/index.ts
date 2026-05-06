@@ -450,9 +450,16 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
       : `@${msg.from_agent}`;
     const humansOnlyTag = meta.humans_only_visible ? " [humans-only]" : "";
     const chatId = meta.chat_id;
-    const replyHint = chatId
-      ? `\n\nReply via \`chat_send(chat_id=${chatId}, content=...)\`. Console output is NOT visible to the owner — chat_send is mandatory.`
-      : `\n\nReply via \`chat_send(...)\`. Console output is NOT visible to the owner — chat_send is mandatory.`;
+    // Action header — placed BEFORE the message content so the model sees the
+    // tool requirement *before* being primed by the content. Without this,
+    // models often start composing a reply in the console (their default
+    // surface) and the chat_send hint at the end gets ignored.
+    const actionHeader = chatId
+      ? `⚠️ ACTION REQUIRED: reply via \`chat_send(chat_id="${chatId}", content="...")\`. ` +
+        `The InBetween chat is the ONLY surface visible to the owner — console output is invisible to them. ` +
+        `Call chat_send EVERY time you respond, even for short acknowledgements. ` +
+        `If no @-mention targets you, you may stay silent (the chat coordinator routes work).\n\n`
+      : `⚠️ ACTION REQUIRED: reply via \`chat_send(...)\`. The InBetween chat is the ONLY surface visible to the owner — console output is invisible. Call chat_send EVERY time.\n\n`;
     // Attachment summary — owner explicitly asked agents NOT to guess.
     // We tell them: there are N files, here are name/size/mime, fetch via
     // attachment_download. We deliberately do NOT embed the signed URL —
@@ -491,7 +498,14 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     const contextBlock = parts.length
       ? `[System context for this chat — apply when replying]\n${parts.join("\n\n")}\n[End system context]\n\n`
       : "";
-    const channelContent = `${contextBlock}📨 New message via InBetween from ${sender}${humansOnlyTag}:\n\n${msg.content}${attachmentBlock}${replyHint}\n\n(message_id: ${msg.message_id})`;
+    // Order: [system context] → [action header] → [message header] →
+    // [content] → [attachments] → [message_id footer]. The action header
+    // sits BEFORE the content so the model sees the tool requirement
+    // before processing the message body.
+    const channelContent =
+      `${contextBlock}${actionHeader}` +
+      `📨 New message via InBetween from ${sender}${humansOnlyTag}:\n\n${msg.content}` +
+      `${attachmentBlock}\n\n(message_id: ${msg.message_id})`;
     await server.notification({
       method: "notifications/claude/channel",
       params: {
@@ -873,8 +887,11 @@ const server = new Server(
   { name: "inbetween", version: "0.1.0" },
   {
     instructions:
-      "InBetween — direct line between AI agents. When you receive a push from this server (📨 New message via InBetween), you MUST reply via the `chat_send` tool. Console output is invisible to the owner in the InBetween UI, so a console-only reply is treated as silence. Console may be used in addition to chat_send (for IDE UX), but chat_send is mandatory. Reply only when @<your_display_name> or @all is mentioned — otherwise stay silent and let the chat coordinator route work. Be concise. " +
-      "Files: pushes that include a `📎 N attachments:` section carry files. Use `attachment_download(message_id, index)` to fetch a fresh signed URL (10-min TTL), then WebFetch it to read the bytes. To send a file yourself, use `attachment_send(chat_id, content, local_path)` — it uploads + posts the message in one atomic call (≤25MB, common image/text/pdf/json MIME types).",
+      "InBetween — direct line between AI agents. Rules for handling pushes from this server (📨 New message via InBetween):\n" +
+      "1. ALWAYS reply via the `chat_send` tool. The InBetween chat is the only surface the owner sees — console output is invisible to them, so a console-only reply is silence. Console is fine as a SECONDARY surface for IDE UX, but chat_send is mandatory and must come first.\n" +
+      "2. Reply only when @<your_display_name> or @all is mentioned in the message. Otherwise stay silent — the chat coordinator routes work.\n" +
+      "3. Be concise. Wake on push, send one chat_send, go quiet.\n" +
+      "4. Files in pushes appear as a `📎 N attachments:` block — call `attachment_download(message_id, index)` for a fresh 10-min signed URL, then WebFetch the bytes. To send a file yourself use `attachment_send(chat_id, content, local_path)` (uploads + posts atomically; ≤25MB; image/png|jpeg|webp|gif, application/pdf|json, text/plain|markdown).",
     capabilities: {
       tools: {},
       resources: {
@@ -1019,7 +1036,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "chat_send",
       description:
-        "PRIMARY reply channel for any incoming InBetween message. ALWAYS call this when responding — console output is invisible to the owner in the InBetween UI, so a console-only reply means the owner does not see your answer. Console can be used in addition (for IDE UX), but chat_send is mandatory.\n\n" +
+        "Call this for EVERY reply to an InBetween push. This is the only surface visible to the owner — console output is NOT shown in the InBetween UI, so a console-only reply is treated as silence. Console output may follow chat_send for IDE UX, but chat_send must come first.\n\n" +
         "Routing for live push is parsed from @-mentions in the message content (the message is always saved for every member regardless):\n" +
         "  - mention `@all` → live push to every member except the sender\n" +
         "  - mention one or more `@<display_name>` → live push only to those agents. Use list_agents (or get_chat) to see each member's exact display_name.\n" +
@@ -1310,11 +1327,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         type: "text",
         text:
           `✓ Acting as @${visibleName} (id=${activeAgentId}). Use list_chats to see chats you're in.\n\n` +
-          `Behavior rules (read these — they're not optional):\n` +
-          `  • PRIMARY reply channel = chat_send. Any message you receive from InBetween must be answered with chat_send. Console output is invisible to the owner in the InBetween UI, so a console-only reply is the same as silence.\n` +
-          `  • Console output is fine as a SECONDARY surface (for IDE UX), but only after chat_send.\n` +
-          `  • Reply only when @${visibleName} or @all is mentioned. Otherwise stay silent — the chat's coordinator will route work.\n` +
-          `  • Be concise. Wake when notified, then go quiet.`,
+          `**Mandatory rules — read these before any reply:**\n` +
+          `  1. Every reply to an InBetween push goes through \`chat_send\` first. The console is invisible to the owner; a console-only reply = silence on their side.\n` +
+          `  2. Reply only when @${visibleName} or @all is in the message. No mention → stay silent (coordinator routes work).\n` +
+          `  3. Be concise. One chat_send per push, then go quiet.\n` +
+          `  4. Console may follow chat_send for IDE UX, but never replace it.`,
       }],
     };
   }
