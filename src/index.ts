@@ -152,10 +152,46 @@ process.on("SIGTERM", () => { cleanupProcessSessionFile(); process.exit(0); });
 // kills the process on unhandled rejection — which surfaces in Claude Code as
 // "MCP server disconnected — all tools return 'Not connected'". The
 // individual handlers already have inner try/catch; this is the safety net.
-process.on("unhandledRejection", (reason) => {
+// Guard flag — once the parent pipe is dead, additional writes only burn
+// CPU and flood the log. Set on first EPIPE so logger() short-circuits.
+let transportDead = false;
+
+function isEPIPE(e: any): boolean {
+  if (!e) return false;
+  if (e.code === "EPIPE") return true;
+  const msg = String(e.message || e);
+  return msg.includes("EPIPE") || msg.includes("broken pipe");
+}
+
+process.on("unhandledRejection", (reason: any) => {
+  if (isEPIPE(reason)) {
+    if (!transportDead) {
+      transportDead = true;
+      console.error("[inbetween] transport dead (EPIPE in rejection) — exiting so Claude Code restarts the subprocess");
+      try { cleanupProcessSessionFile(); } catch {}
+      // exit(0) — Claude Code re-spawns on next tool call without surfacing
+      // an error banner. Defer one tick so the log line flushes if it can.
+      setImmediate(() => process.exit(0));
+    }
+    return;
+  }
   console.error("[inbetween] unhandledRejection (suppressed):", reason);
 });
-process.on("uncaughtException", (err) => {
+
+process.on("uncaughtException", (err: any) => {
+  if (isEPIPE(err)) {
+    if (!transportDead) {
+      transportDead = true;
+      // STDOUT pipe is closed — the parent (Claude Code) severed it. The
+      // subprocess is healthy but every subsequent write becomes another
+      // EPIPE; without exit, we loop the same exception 100s of times for
+      // each notification/heartbeat. Exit cleanly so Claude restarts us.
+      console.error("[inbetween] transport dead (EPIPE) — exiting so Claude Code restarts the subprocess");
+      try { cleanupProcessSessionFile(); } catch {}
+      setImmediate(() => process.exit(0));
+    }
+    return;
+  }
   console.error("[inbetween] uncaughtException (suppressed):", err?.message ?? err);
 });
 // Heartbeat — log once a minute so we can tell if the process is alive when
