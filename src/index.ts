@@ -158,6 +158,15 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (err) => {
   console.error("[inbetween] uncaughtException (suppressed):", err?.message ?? err);
 });
+// Heartbeat — log once a minute so we can tell if the process is alive when
+// the user reports tool calls returning "Not connected" but no fresh logs.
+setInterval(() => {
+  console.error(`[inbetween] heartbeat pid=${process.pid} uptime=${process.uptime().toFixed(0)}s`);
+}, 60_000).unref();
+// On any flavour of process death, leave a final breadcrumb in the log so we
+// can tell whether MCP died vs the transport got severed.
+process.on("beforeExit", (code) => console.error(`[inbetween] beforeExit code=${code}`));
+process.on("exit", (code) => console.error(`[inbetween] exit code=${code}`));
 
 // =================================================================
 // OWNER-LEVEL SESSION (Layer 0) — `~/.inbetween/owner.json`
@@ -1097,13 +1106,18 @@ const LAYER1_TOOLS = new Set(["agent_login", "agent_logout"]);
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+  const callId = Math.random().toString(36).slice(2, 8);
+  console.error(`[inbetween] TOOL_CALL start id=${callId} name=${name}`);
 
   // Gate: every Layer-2 tool (everything not in LAYER0/LAYER1) requires
   // both owner_login AND agent_login. We check up-front so each handler
   // body can assume identity is set.
   if (!LAYER0_TOOLS.has(name) && !LAYER1_TOOLS.has(name)) {
     const err = requireAgent();
-    if (err) return { content: [{ type: "text", text: `✗ ${err}` }], isError: true };
+    if (err) {
+      console.error(`[inbetween] TOOL_CALL gate-fail id=${callId} name=${name} err=${err}`);
+      return { content: [{ type: "text", text: `✗ ${err}` }], isError: true };
+    }
   }
 
   // ===== Layer 0 — owner auth =====
