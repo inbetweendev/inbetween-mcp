@@ -116,6 +116,18 @@ process.on("exit", cleanupProcessSessionFile);
 process.on("SIGINT", () => { cleanupProcessSessionFile(); process.exit(0); });
 process.on("SIGTERM", () => { cleanupProcessSessionFile(); process.exit(0); });
 
+// Hard guard: never let an async fire-and-forget rejection (notify*, send_json
+// after-close etc.) tear the MCP subprocess down. Without these, modern Node
+// kills the process on unhandled rejection — which surfaces in Claude Code as
+// "MCP server disconnected — all tools return 'Not connected'". The
+// individual handlers already have inner try/catch; this is the safety net.
+process.on("unhandledRejection", (reason) => {
+  console.error("[inbetween] unhandledRejection (suppressed):", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[inbetween] uncaughtException (suppressed):", err?.message ?? err);
+});
+
 // =================================================================
 // OWNER-LEVEL SESSION (Layer 0) — `~/.inbetween/owner.json`
 // =================================================================
@@ -274,7 +286,7 @@ function connectWebSocket(): void {
         if (!inbox.find((m) => m.message_id === msg.message_id)) {
           inbox.unshift(msg);
           if (inbox.length > MAX_INBOX_SIZE) inbox.pop();
-          notifyClaudeAboutMessage(msg);
+          notifyClaudeAboutMessage(msg).catch((e) => console.error("[inbetween] notify-message threw:", e));
         }
       } else if (event.type === "inbox_summary") {
         // Summary-on-connect: backend шлёт это вместо N отдельных new_message.
@@ -301,7 +313,8 @@ function connectWebSocket(): void {
             if (inbox.length > MAX_INBOX_SIZE) inbox.pop();
           }
         }
-        notifyClaudeAboutInboxSummary(event.total || items.length, event.chat_count || 0);
+        notifyClaudeAboutInboxSummary(event.total || items.length, event.chat_count || 0)
+          .catch((e) => console.error("[inbetween] notify-summary threw:", e));
       } else if (event.type === "new_messages_batch") {
         const items: any[] = event.messages || [];
         const fresh: any[] = [];
@@ -320,20 +333,20 @@ function connectWebSocket(): void {
             fresh.push(m);
           }
         }
-        if (fresh.length > 0) notifyClaudeAboutBatch(fresh);
+        if (fresh.length > 0) notifyClaudeAboutBatch(fresh).catch((e) => console.error("[inbetween] notify-batch threw:", e));
       } else if (event.type === "you_were_removed_from_chat") {
-        notifyClaudeAboutChatRemoval(event.chat_id);
+        notifyClaudeAboutChatRemoval(event.chat_id).catch((e) => console.error("[inbetween] notify-removal threw:", e));
       } else if (event.type === "wake") {
-        notifyClaudeAboutWake(event);
+        notifyClaudeAboutWake(event).catch((e) => console.error("[inbetween] notify-wake threw:", e));
       } else if (event.type === "task_created" || event.type === "task_assigned" || event.type === "task_updated" || event.type === "task_done") {
-        notifyClaudeAboutTask(event);
+        notifyClaudeAboutTask(event).catch((e) => console.error("[inbetween] notify-task threw:", e));
       } else if (event.type === "agent.updated") {
         // Backend broadcasts this when an agent in the chat is renamed
         // or has bio/display_name updated. We only surface it when the
         // change is about THIS agent (the one this MCP session is logged
         // into) — owner-side roster updates are noise here.
         if (event.agent && Number(event.agent.id) === activeAgentId) {
-          notifyClaudeAboutSelfUpdated(event.agent);
+          notifyClaudeAboutSelfUpdated(event.agent).catch((e) => console.error("[inbetween] notify-self-updated threw:", e));
         }
       } else if (event.type === "heartbeat_ack") {
         // OK
