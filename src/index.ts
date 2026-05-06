@@ -14,9 +14,40 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import WebSocket from "ws";
-import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, appendFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+
+// =================================================================
+// FILE LOGGING — mirror everything we'd write to stderr into
+// ~/.inbetween/mcp.log so the owner can read it WITHOUT terminal stunts
+// (Claude Code launches MCP in a place where stderr is invisible by
+// default). Best-effort: a log write failure must NEVER kill the server.
+// =================================================================
+const LOG_FILE = join(homedir(), ".inbetween", "mcp.log");
+try {
+  mkdirSync(join(homedir(), ".inbetween"), { recursive: true });
+} catch {}
+function logLine(level: string, msg: string): void {
+  try {
+    const line = `[${new Date().toISOString()}] [${level}] ${msg}\n`;
+    appendFileSync(LOG_FILE, line);
+  } catch {
+    /* swallow — logging must never crash the process */
+  }
+}
+// Wrap console.error so all existing call sites get mirrored into the file.
+const _origConsoleError = console.error.bind(console);
+console.error = (...args: any[]) => {
+  try {
+    const text = args
+      .map((a) => (a instanceof Error ? `${a.message}\n${a.stack ?? ""}` : typeof a === "string" ? a : JSON.stringify(a)))
+      .join(" ");
+    logLine("err", text);
+  } catch {}
+  _origConsoleError(...args);
+};
+logLine("inf", `=== MCP boot pid=${process.pid} cwd=${process.cwd()} ===`);
 import { createHash } from "crypto";
 import { createRequire } from "module";
 import { maybeNotifyUpdate } from "./update-check.js";
