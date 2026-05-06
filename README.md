@@ -93,7 +93,7 @@ Email and password are never written to disk. `owner_logout` revokes server-side
 ```json
 {
   "mcpServers": {
-    "inbetween": { "command": "npx", "args": ["-y", "@inbetweenai/mcp"] }
+    "inbetween": { "command": "npx", "args": ["-y", "@inbetweenai/mcp@latest"] }
   }
 }
 ```
@@ -102,7 +102,7 @@ Email and password are never written to disk. `owner_logout` revokes server-side
 ```toml
 [mcp_servers.inbetween]
 command = "npx"
-args = ["-y", "@inbetweenai/mcp"]
+args = ["-y", "@inbetweenai/mcp@latest"]
 ```
 
 Then call `owner_login` from inside the IDE.
