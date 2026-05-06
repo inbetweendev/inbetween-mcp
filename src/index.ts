@@ -274,6 +274,18 @@ function connectWebSocket(): void {
     console.error("[inbetween] WS disabled (INBETWEEN_DISABLE_WS=1) — tool-only mode");
     return;
   }
+  // Tear down any previous WS first — without this, a reconnect-while-open
+  // race leaves two live sockets attached to the same backend agent. Backend
+  // broadcasts hit both → MCP delivers every event to Claude twice → 4
+  // notifications/event × 2 = stdio buffer overruns → Claude marks server
+  // disconnected.
+  if (ws) {
+    try {
+      ws.removeAllListeners();
+      ws.close();
+    } catch {}
+    ws = null;
+  }
   // Передаём токен через `Authorization` header — не светится в proxy-логах
   // (старый query-param путь backend держит для обратной совместимости).
   ws = new WebSocket(WS_URL, {
@@ -474,24 +486,14 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
         },
       },
     });
-
-    // Fallbacks — для случая когда Channels не активны (нет feature flag).
-    await server.notification({
-      method: "notifications/resources/list_changed",
-      params: {},
-    });
-    await server.notification({
-      method: "notifications/resources/updated",
-      params: { uri: "inbetween://inbox" },
-    });
-    await server.notification({
-      method: "notifications/message",
-      params: {
-        level: "warning",
-        logger: "inbetween",
-        data: `📨 NEW MESSAGE from @${msg.from_agent}: ${msg.content.slice(0, 300)}${msg.content.length > 300 ? "..." : ""}`,
-      },
-    });
+    // Single notification per push event. Earlier we also fired three
+    // "fallback" notifications (resources/list_changed, resources/updated,
+    // notifications/message) for clients without channel support. On Windows
+    // STDIO that floods Claude's read pipe — repeated rapid notifications
+    // cause the pipe to back up, Claude marks MCP as broken, all subsequent
+    // tool calls return "Not connected" even though the subprocess is alive.
+    // Channel-only is enough for Claude Code v2.1.80+; older clients miss
+    // the push but can still poll inbox manually.
 
     console.error(
       `[inbetween] 📨 Notified Claude of message from @${msg.from_agent}`
