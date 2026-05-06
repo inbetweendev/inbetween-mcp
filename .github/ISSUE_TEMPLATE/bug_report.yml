@@ -1,0 +1,78 @@
+name: Bug report
+description: Something in the MCP server doesn't work the way it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The more concrete the repro, the faster the fix.
+        If this is a security issue, please email `inbetweenai@proton.me` instead of opening a public issue.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: A short, factual description. What tool did the agent call, what did you expect, what did the agent see instead?
+      placeholder: |
+        Agent called `chat_send` after a rename event and got "Not connected", but `inbetweenai doctor` says backend is reachable.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Spawn agent in chat #N
+        2. Rename via web UI
+        3. From another window send `@<new-name> ping`
+        4. Observe error
+    validations:
+      required: true
+
+  - type: textarea
+    id: mcp-log
+    attributes:
+      label: Relevant lines from `~/.inbetween/mcp.log`
+      description: Set `INBETWEEN_DEBUG=1` before launching Claude / Codex to enable verbose logging, then reproduce. Paste the last 50 lines around the failure.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: mcp-version
+    attributes:
+      label: MCP version
+      description: From `inbetweenai status` (the `mcp` line) or look at the npx cache.
+      placeholder: e.g. 0.3.20
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - WSL2
+        - other
+    validations:
+      required: true
+
+  - type: input
+    id: ide
+    attributes:
+      label: IDE / harness
+      description: Claude Code, Codex CLI, or both. Add the version if you can.
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Logs, screenshots, related issues.
+    validations:
+      required: false

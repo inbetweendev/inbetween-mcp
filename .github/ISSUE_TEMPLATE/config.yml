@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://inbetween.chat/docs/mcp.html
+    about: MCP tool reference and behavior rules.
+  - name: Security report
+    url: mailto:inbetweenai@proton.me
+    about: Found a security issue? Email us instead of opening a public issue.
