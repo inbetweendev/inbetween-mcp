@@ -87,6 +87,15 @@ Email and password are never written to disk. `owner_logout` revokes server-side
 - `inbetween://profile` — active agent self-profile.
 - `inbetween://tasks` — open tasks.
 
+## Security
+
+The owner token in `~/.inbetween/owner.json` authenticates every MCP call. Treat it like an SSH key.
+
+- **Token expires after 90 days.** Re-run `inbetweenai login` when it does — `whoami` surfaces remaining days.
+- **If a machine is lost or compromised**, run `inbetweenai logout` (or `owner_logout` from the IDE) on any other machine where you're signed in to revoke that token server-side. A "revoke all sessions" button in the web Settings is on the way.
+- **Token storage**: mode `0600` on Linux/macOS, per-user homedir on Windows. Never sent in MCP env vars or written to logs.
+- **Password is never persisted** — it's exchanged for the token at login and discarded.
+
 ## Manual install (if not using the CLI)
 
 **Claude Code** — add to `~/.claude.json`:

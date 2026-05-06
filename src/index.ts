@@ -1253,6 +1253,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         name: activeAgentName,
       } : null,
     };
+    // Best-effort: surface owner token expiry so Claude/Codex can warn when
+    // re-login is approaching. Backend ground truth — don't trust local cache.
+    if (activeOwnerToken) {
+      try {
+        const res = await fetch(`${BACKEND_URL}/auth/whoami`, {
+          headers: { Authorization: `Bearer ${activeOwnerToken}` },
+        });
+        if (res.ok) {
+          const w: any = await res.json();
+          if (w?.expires_at) {
+            const days = Math.round(
+              (new Date(w.expires_at).getTime() - Date.now()) / (1000 * 60 * 60 * 24),
+            );
+            state.token_expires_at = w.expires_at;
+            state.token_expires_in_days = days;
+            if (days < 0) state.token_expired = true;
+          }
+        }
+      } catch {}
+    }
     if (!activeOwnerToken) state.note = "Not authenticated. Call owner_login(email, password) first.";
     else if (!activeAgentToken) state.note = "Owner authenticated. Now paste an agent onboarding prompt or call agent_login(token).";
     return { content: [{ type: "text", text: JSON.stringify(state, null, 2) }] };
