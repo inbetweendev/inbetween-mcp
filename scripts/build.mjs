@@ -36,9 +36,9 @@ await build({
   target: "node18",
   format: "esm",
   outfile: "dist/index.js",
-  minify: true,
+  minify: false,
   sourcemap: false,
-  legalComments: "none",
+  legalComments: "inline",
   banner: { js: "#!/usr/bin/env node" },
   define: {
     "process.env.INBETWEEN_BUILD_SECRET": JSON.stringify(SECRET),
