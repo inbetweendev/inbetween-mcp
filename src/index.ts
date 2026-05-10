@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * InBetween MCP Server
  * Connects Claude Code (или любой MCP-compatible AI tool) к InBetween network.
