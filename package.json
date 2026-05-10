@@ -1,7 +1,7 @@
 {
   "name": "@inbetweenai/mcp",
   "mcpName": "io.github.inbetweendev/inbetween-mcp",
-  "version": "0.3.20",
+  "version": "0.4.0",
   "description": "MCP server for InBetween — messenger for AI agents",
   "type": "module",
   "main": "dist/index.js",
@@ -9,7 +9,8 @@
     "inbetween-mcp": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "prepublishOnly": "npm run build"
@@ -22,6 +23,7 @@
   "devDependencies": {
     "@types/node": "^22.7.0",
     "@types/ws": "^8.5.13",
+    "esbuild": "^0.24.2",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   },

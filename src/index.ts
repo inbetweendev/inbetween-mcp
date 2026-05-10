@@ -70,6 +70,7 @@ if (DEBUG) logLine("inf", `=== MCP boot pid=${process.pid} cwd=${process.cwd()} 
 import { createHash } from "crypto";
 import { createRequire } from "module";
 import { maybeNotifyUpdate } from "./update-check.js";
+import { signedFetch, wsHandshakeHeaders } from "./signed-fetch.js";
 
 // =================================================================
 // CONFIG
@@ -321,6 +322,10 @@ interface Message {
   attachments: any[];
   metadata: any;
   sent_at: string;
+  // Server-rendered notification text. Backend >= 0.4.0 always sets this;
+  // when present we forward it verbatim to the IDE notification surface
+  // and the client-side templating below is bypassed.
+  formatted_body?: string | null;
 }
 
 const inbox: Message[] = [];
@@ -362,6 +367,7 @@ function connectWebSocket(): void {
   ws = new WebSocket(WS_URL, {
     headers: {
       Authorization: `Bearer ${activeAgentToken}`,
+      ...wsHandshakeHeaders(),
     },
   });
 
@@ -403,6 +409,7 @@ function connectWebSocket(): void {
             recipient_display_name: event.recipient_display_name ?? null,
           },
           sent_at: event.sent_at,
+          formatted_body: event.formatted_body ?? null,
         };
         // Dedup: если сообщение уже в кеше — это duplicate из polling
         // fallback, заглушаем повторное уведомление.
@@ -443,10 +450,11 @@ function connectWebSocket(): void {
         // chance of being rendered visibly.
         const total = event.total || items.length;
         const chatCount = event.chat_count || 0;
-        notifyClaudeAboutInboxSummary(total, chatCount)
+        const serverRenderedSummary = event.formatted_body ?? null;
+        notifyClaudeAboutInboxSummary(total, chatCount, serverRenderedSummary)
           .catch((e) => console.error("[inbetween] notify-summary threw:", e));
         setTimeout(() => {
-          notifyClaudeAboutInboxSummary(total, chatCount)
+          notifyClaudeAboutInboxSummary(total, chatCount, serverRenderedSummary)
             .catch((e) => console.error("[inbetween] notify-summary (retry) threw:", e));
         }, 2000);
       } else if (event.type === "new_messages_batch") {
@@ -467,9 +475,9 @@ function connectWebSocket(): void {
             fresh.push(m);
           }
         }
-        if (fresh.length > 0) notifyClaudeAboutBatch(fresh).catch((e) => console.error("[inbetween] notify-batch threw:", e));
+        if (fresh.length > 0) notifyClaudeAboutBatch(fresh, event.formatted_body ?? null).catch((e) => console.error("[inbetween] notify-batch threw:", e));
       } else if (event.type === "you_were_removed_from_chat") {
-        notifyClaudeAboutChatRemoval(event.chat_id).catch((e) => console.error("[inbetween] notify-removal threw:", e));
+        notifyClaudeAboutChatRemoval(event.chat_id, event.formatted_body ?? null).catch((e) => console.error("[inbetween] notify-removal threw:", e));
       } else if (event.type === "wake") {
         notifyClaudeAboutWake(event).catch((e) => console.error("[inbetween] notify-wake threw:", e));
       } else if (event.type === "task_created" || event.type === "task_assigned" || event.type === "task_updated" || event.type === "task_done") {
@@ -525,11 +533,46 @@ function connectWebSocket(): void {
 // =================================================================
 async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
   try {
-    // 🔥 NATIVE PUSH — Claude Code Channels (v2.1.80+).
-    // Это инжектит сообщение прямо в открытую сессию юзера, без его prompt-а.
-    // Требует у юзера feature flag tengu_harbor + запуск с
-    // --dangerously-load-development-channels (или approved allowlist).
     const meta = (msg.metadata as any) || {};
+    // Server-rendered fast path: backend >= 0.4.0 always sets
+    // formatted_body. We forward it verbatim plus inject the chat-scoped
+    // [System context] block (effective_prompt) which IS still client-
+    // side because it lives in the IDE's session prompt, not the
+    // notification body. Pre-0.4.0 backends fall through to the legacy
+    // templating below — those bundles can no longer reach a current
+    // backend (version gate), so this branch is effectively dead in
+    // production, kept only so the file still compiles cleanly without
+    // the new event field.
+    if (msg.formatted_body) {
+      const eff = (meta.effective_prompt as { system_prompt?: string | null; persona?: string | null } | null) || null;
+      const currentHandle = (meta.recipient_display_name as string | null | undefined) || activeAgentName;
+      const ctxParts: string[] = [];
+      if (currentHandle) {
+        ctxParts.push(
+          `Your current handle in this chat is @${currentHandle}. ` +
+          `Reply ONLY when @${currentHandle} or @all is mentioned, even if your original onboarding prompt referenced a different name.`,
+        );
+      }
+      if (eff?.persona) ctxParts.push(`Persona: ${eff.persona}`);
+      if (eff?.system_prompt) ctxParts.push(eff.system_prompt);
+      const ctxBlock = ctxParts.length
+        ? `[System context for this chat — apply when replying]\n${ctxParts.join("\n\n")}\n[End system context]\n\n`
+        : "";
+      await server.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: ctxBlock + msg.formatted_body,
+          meta: {
+            source: "inbetween",
+            from_agent: msg.from_agent,
+            message_id: msg.message_id,
+            sent_at: msg.sent_at,
+          },
+        },
+      });
+      console.error(`[inbetween] 📨 forwarded server-rendered push from @${msg.from_agent}`);
+      return;
+    }
     const fromHuman = !!meta.from_human;
     const ownerHandle = meta.from_owner_handle as string | null | undefined;
     const sender = fromHuman
@@ -622,16 +665,16 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
   }
 }
 
-async function notifyClaudeAboutInboxSummary(total: number, chatCount: number): Promise<void> {
+async function notifyClaudeAboutInboxSummary(total: number, chatCount: number, serverRendered?: string | null): Promise<void> {
   // Fire even when total=0. The "you're caught up" version reminds the
   // agent on reconnect to check open tasks — silent reconnect = silent
   // agent, which the owner reads as the system being broken.
   try {
-    const text = total > 0
+    const text = serverRendered ?? (total > 0
       ? `📥 You have ${total} unread message${total === 1 ? "" : "s"}` +
         (chatCount ? ` in ${chatCount} chat${chatCount === 1 ? "" : "s"}` : "") +
         `. Call \`inbox_unread()\` to read, then handle each one via \`chat_send\`.`
-      : `✓ Connected. Inbox is clear. Call \`tasks_list\` to see open work — there may be tasks assigned to you that haven't been picked up yet.`;
+      : `✓ Connected. Inbox is clear. Call \`tasks_list\` to see open work — there may be tasks assigned to you that haven't been picked up yet.`);
     await server.notification({
       method: "notifications/claude/channel",
       params: {
@@ -649,7 +692,7 @@ async function notifyClaudeAboutInboxSummary(total: number, chatCount: number): 
   }
 }
 
-async function notifyClaudeAboutBatch(items: any[]): Promise<void> {
+async function notifyClaudeAboutBatch(items: any[], serverRendered?: string | null): Promise<void> {
   if (items.length === 0) return;
   if (items.length === 1) return notifyClaudeAboutMessage(items[0]);
   try {
@@ -658,7 +701,7 @@ async function notifyClaudeAboutBatch(items: any[]): Promise<void> {
       .map((m) => `• @${m.from_agent}: ${(m.content || "").slice(0, 120)}`)
       .join("\n");
     const more = items.length > 5 ? `\n…and ${items.length - 5} more` : "";
-    const text = `📨 ${items.length} new messages via InBetween:\n${summary}${more}`;
+    const text = serverRendered ?? `📨 ${items.length} new messages via InBetween:\n${summary}${more}`;
     await server.notification({
       method: "notifications/claude/channel",
       params: { content: text, meta: { source: "inbetween", batch: true, count: items.length } },
@@ -701,14 +744,15 @@ async function notifyClaudeAboutMemberChange(event: any): Promise<void> {
     const handle = agent.display_name || agent.name || "agent";
     const ownerHandle = event.owner_handle ? ` (@${event.owner_handle})` : "";
     const verb = action === "joined" ? "👋 joined" : "🚪 left";
+    const fallback =
+      `${verb} chat #${chatId}: @${handle}${ownerHandle}. ` +
+      (action === "joined"
+        ? `Roster shifted — call \`list_agents\` if delegating; \`tasks_list\` to see open work.`
+        : `Any task you delegated to them is now orphaned — call \`tasks_list\` and re-route or close.`);
     await server.notification({
       method: "notifications/claude/channel",
       params: {
-        content:
-          `${verb} chat #${chatId}: @${handle}${ownerHandle}. ` +
-          (action === "joined"
-            ? `Roster shifted — call \`list_agents\` if delegating; \`tasks_list\` to see open work.`
-            : `Any task you delegated to them is now orphaned — call \`tasks_list\` and re-route or close.`),
+        content: event.formatted_body ?? fallback,
         meta: { source: "inbetween", kind: event.type, chat_id: chatId, agent_id: agent.id },
       },
     });
@@ -718,16 +762,17 @@ async function notifyClaudeAboutMemberChange(event: any): Promise<void> {
   }
 }
 
-async function notifyClaudeAboutChatRemoval(chatId: number | string | null): Promise<void> {
+async function notifyClaudeAboutChatRemoval(chatId: number | string | null, serverRendered?: string | null): Promise<void> {
   try {
     const idText = chatId == null ? "?" : String(chatId);
+    const fallback =
+      `🚪 You were removed from chat #${idText}. ` +
+      `Won't receive further messages from there. ` +
+      `Stop responding for that chat_id.`;
     await server.notification({
       method: "notifications/claude/channel",
       params: {
-        content:
-          `🚪 You were removed from chat #${idText}. ` +
-          `Won't receive further messages from there. ` +
-          `Stop responding for that chat_id.`,
+        content: serverRendered ?? fallback,
         meta: { source: "inbetween", kind: "removed_from_chat", chat_id: chatId },
       },
     });
@@ -760,13 +805,13 @@ async function notifyClaudeAboutTask(event: any): Promise<void> {
       event.type === "task_assigned" ? "assigned to you" :
       "created";
     const chatHint = event.chat_id ? ` (chat ${event.chat_id})` : "";
-    const content =
+    const fallback =
       `🗒 Task #${event.task_id} ${verb} by @${event.from_agent}${chatHint}: ${event.title}\n\n` +
       `Call \`tasks_list\` to see details. When you finish work on a task, ALWAYS call \`tasks_upsert(id=${event.task_id}, status="done")\` so the chat sees you closed it.`;
     await server.notification({
       method: "notifications/claude/channel",
       params: {
-        content,
+        content: event.formatted_body ?? fallback,
         meta: { source: "inbetween", kind: "task", task_id: event.task_id, task_event: event.type },
       },
     });
@@ -843,7 +888,7 @@ async function api<T = any>(
   if (!tok) {
     throw new Error("Not authenticated. Call owner_login(email, password) and then agent_login(token).");
   }
-  const res = await fetch(`${BACKEND_URL}${path}`, {
+  const res = await signedFetch(`${BACKEND_URL}${path}`, {
     method,
     headers: {
       "Content-Type": "application/json",
@@ -1318,7 +1363,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     let owner_token: string | undefined;
     let owner_id: string | undefined;
     try {
-      const res = await fetch(`${BACKEND_URL}/auth/cli-login`, {
+      const res = await signedFetch(`${BACKEND_URL}/auth/cli-login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),
@@ -1357,7 +1402,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const tokenToRevoke = activeOwnerToken;
     if (tokenToRevoke) {
       try {
-        await fetch(`${BACKEND_URL}/auth/cli-logout`, {
+        await signedFetch(`${BACKEND_URL}/auth/cli-logout`, {
           method: "POST",
           headers: { Authorization: `Bearer ${tokenToRevoke}` },
         });
@@ -1390,7 +1435,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // re-login is approaching. Backend ground truth — don't trust local cache.
     if (activeOwnerToken) {
       try {
-        const res = await fetch(`${BACKEND_URL}/auth/whoami`, {
+        const res = await signedFetch(`${BACKEND_URL}/auth/whoami`, {
           headers: { Authorization: `Bearer ${activeOwnerToken}` },
         });
         if (res.ok) {
