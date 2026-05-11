@@ -1094,6 +1094,25 @@ async function deleteTask(id: number) {
   return api("DELETE", `/tasks/${id}`);
 }
 
+// === Checkpoints — short "what + why" notes a project leaves in a chat ===
+async function createCheckpoint(payload: { chat_id: number; title: string; summary: string }) {
+  return api("POST", "/checkpoints", payload);
+}
+async function listCheckpoints(chat_id: number, limit = 50) {
+  return api("GET", `/checkpoints?chat_id=${chat_id}&limit=${limit}`);
+}
+
+// === Scheduled pings — one-shot delayed message in a chat ===
+async function createScheduledPing(payload: { chat_id: number; content: string; delay_seconds: number }) {
+  return api("POST", "/scheduled_pings", payload);
+}
+async function listScheduledPings(chat_id: number) {
+  return api("GET", `/scheduled_pings?chat_id=${chat_id}`);
+}
+async function cancelScheduledPing(id: number) {
+  return api("DELETE", `/scheduled_pings/${id}`);
+}
+
 // === Unified chats ===
 async function listChats() {
   return api("GET", "/chats");
@@ -1310,6 +1329,73 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           chat_id: { type: "number", description: "Attach task to a chat (optional but recommended — without it the task is invisible to chat members)" },
           completion_note: { type: "string", description: "Optional 'what was done' note when closing a task (≤1000 chars)" },
         },
+      },
+    },
+    // ===== Checkpoints — project journal =====
+    {
+      name: "checkpoint_create",
+      description:
+        "Drop a short 'what + why' record on the project log of a chat. NOT for every keystroke — call this when something substantive happened: a feature shipped, a migration applied, an architecture decision made, a bug investigated. The chat sees a quiet system event in the timeline; the full text lives in the checkpoint store and is fetched via `checkpoints_list`. Use this so other agents (and the human owner) entering the chat days later can quickly understand the course of the project without scrolling through every message.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "number", description: "Chat where the work happened" },
+          title: { type: "string", description: "One-line headline (≤256 chars). Example: 'Migration 037 shipped' / 'Auth rewrite — picked option B'" },
+          summary: { type: "string", description: "Multi-line body — what was done and (importantly) WHY. Future-you / other agents read this to catch up." },
+        },
+        required: ["chat_id", "title", "summary"],
+      },
+    },
+    {
+      name: "checkpoints_list",
+      description:
+        "Read the project log for a chat (newest first). CALL THIS when you enter a chat after a long pause, when the owner asks 'what's been happening here', or before making a big change so you don't undo a decision a previous agent already made. Returns title + summary + author + timestamp.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "number" },
+          limit: { type: "number", default: 50, description: "Max entries (cap 200)" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    // ===== Scheduled pings — wake the chat later =====
+    {
+      name: "schedule_ping",
+      description:
+        "Schedule a chat message to be sent later by YOU (the active agent). Use this when you're about to end your session but you (or other agents) should pick the work up after a wait — e.g. 'a build is running, ping back in 30 minutes', 'partner team will reply by EoD, prod me tomorrow morning'. When `run_at` hits, the backend posts `content` as if you typed it in chat_send right now — same @-mention routing wakes the targeted agents. Use `@all` to wake everyone, or `@<display_name>` to wake specific agents. `delay_seconds` is 10s minimum, 24h (86400) maximum.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "number", description: "Chat to ping" },
+          delay_seconds: { type: "number", description: "How many seconds from now until the message fires (10–86400)" },
+          content: { type: "string", description: "Message text — include @<handle> or @all to wake recipients on fire" },
+        },
+        required: ["chat_id", "delay_seconds", "content"],
+      },
+    },
+    {
+      name: "list_scheduled_pings",
+      description:
+        "List pending scheduled pings for a chat (yours and others'). Returns the ones that haven't fired yet, ordered by run_at ascending. Useful to check what's already queued so you don't double-schedule, and to find the ping_id if you want to cancel.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "number" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "cancel_scheduled_ping",
+      description:
+        "Cancel a pending ping you scheduled earlier. Only the original scheduler can cancel. Already-fired pings can't be cancelled — they've shipped.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          id: { type: "number", description: "ping_id from `list_scheduled_pings`" },
+        },
+        required: ["id"],
       },
     },
     // ===== Unified chats =====
@@ -1723,6 +1809,57 @@ ${JSON.stringify(r, null, 2)}` }] };
     const r = await createTask(payload);
     return { content: [{ type: "text", text: `✓ Task #${(r as any).id} created
 ${JSON.stringify(r, null, 2)}` }] };
+  }
+
+  // ===== Checkpoints =====
+  if (name === "checkpoint_create") {
+    const chat_id = args?.chat_id as number | undefined;
+    const title = args?.title as string | undefined;
+    const summary = args?.summary as string | undefined;
+    if (chat_id == null || !title || !summary) {
+      return { content: [{ type: "text", text: "✗ chat_id, title, summary all required" }], isError: true };
+    }
+    const r = await createCheckpoint({ chat_id, title, summary });
+    return { content: [{ type: "text", text: `✓ Checkpoint #${(r as any).id} created
+${JSON.stringify(r, null, 2)}` }] };
+  }
+  if (name === "checkpoints_list") {
+    const chat_id = args?.chat_id as number | undefined;
+    if (chat_id == null) {
+      return { content: [{ type: "text", text: "✗ chat_id required" }], isError: true };
+    }
+    const limit = (args?.limit as number) || 50;
+    const r = await listCheckpoints(chat_id, limit);
+    return { content: [{ type: "text", text: JSON.stringify((r as any).checkpoints, null, 2) }] };
+  }
+
+  // ===== Scheduled pings =====
+  if (name === "schedule_ping") {
+    const chat_id = args?.chat_id as number | undefined;
+    const delay_seconds = args?.delay_seconds as number | undefined;
+    const content = args?.content as string | undefined;
+    if (chat_id == null || delay_seconds == null || !content) {
+      return { content: [{ type: "text", text: "✗ chat_id, delay_seconds, content all required" }], isError: true };
+    }
+    const r = await createScheduledPing({ chat_id, delay_seconds, content });
+    return { content: [{ type: "text", text: `✓ Ping #${(r as any).id} scheduled — fires at ${(r as any).run_at}
+${JSON.stringify(r, null, 2)}` }] };
+  }
+  if (name === "list_scheduled_pings") {
+    const chat_id = args?.chat_id as number | undefined;
+    if (chat_id == null) {
+      return { content: [{ type: "text", text: "✗ chat_id required" }], isError: true };
+    }
+    const r = await listScheduledPings(chat_id);
+    return { content: [{ type: "text", text: JSON.stringify((r as any).pings, null, 2) }] };
+  }
+  if (name === "cancel_scheduled_ping") {
+    const id = args?.id as number | undefined;
+    if (id == null) {
+      return { content: [{ type: "text", text: "✗ id required" }], isError: true };
+    }
+    await cancelScheduledPing(id);
+    return { content: [{ type: "text", text: `✓ Ping #${id} cancelled` }] };
   }
 
   // ===== Unified chats =====
