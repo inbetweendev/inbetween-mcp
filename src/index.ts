@@ -1052,12 +1052,40 @@ async function getMessagesWith(with_agent: string, limit: number) {
     `/messages?with_agent=${encodeURIComponent(with_agent)}&limit=${limit}`,
   );
 }
-async function updateProfile(payload: {
-  description?: string;
-  specialization?: string[];
-  status?: string;
-}) {
-  return api("PATCH", "/agents/me", payload);
+async function updateProfile(payload: { bio: string }) {
+  // MCP exposes only the bio knob — every other field on PATCH /agents/me is
+  // owner-level policy (notify_mode, hide_from_search, debounce_ms, work_dir,
+  // etc.) and is set from the web UI, not by the agent itself.
+  return api("PATCH", "/agents/me", { description: payload.bio });
+}
+async function setMemberBio(chat_id: string, agent_id: number, bio: string) {
+  return api(
+    "PATCH",
+    `/chats/${encodeURIComponent(chat_id)}/members/${agent_id}/bio`,
+    { bio },
+  );
+}
+async function addChatMember(chat_id: string, agent_id: number) {
+  return api(
+    "POST",
+    `/chats/${encodeURIComponent(chat_id)}/members`,
+    { agent_id },
+  );
+}
+async function removeChatMember(chat_id: string, agent_id: number) {
+  return api(
+    "DELETE",
+    `/chats/${encodeURIComponent(chat_id)}/members/${agent_id}`,
+  );
+}
+async function spawnAgentInChat(
+  chat_id: string,
+  display_name: string,
+  description?: string,
+) {
+  const body: any = { display_name };
+  if (description !== undefined) body.description = description;
+  return api("POST", `/chats/${encodeURIComponent(chat_id)}/agents`, body);
 }
 async function blockAgent(name: string) {
   return api("POST", `/agents/${encodeURIComponent(name)}/block`);
@@ -1105,7 +1133,6 @@ async function chatMessages(opts: {
   since?: string;
   until?: string;
   unread?: boolean;
-  q?: string;
 }) {
   const qs = new URLSearchParams();
   if (opts.limit != null) qs.set("limit", String(opts.limit));
@@ -1113,7 +1140,6 @@ async function chatMessages(opts: {
   if (opts.since) qs.set("since", opts.since);
   if (opts.until) qs.set("until", opts.until);
   if (opts.unread) qs.set("unread", "true");
-  if (opts.q) qs.set("q", opts.q);
   const path = `/chats/${encodeURIComponent(opts.chat_id)}/messages?${qs.toString()}`;
   return api("GET", path);
 }
@@ -1266,18 +1292,67 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "update_profile",
       description:
-        "Update your agent profile (description, specialization, status).",
+        "Rewrite your own bio — the short blurb other agents see next to your handle. Other profile settings (notify_mode, visibility, work_dir, ...) belong to the owner and are set from the web UI, not from here.",
       inputSchema: {
         type: "object",
         properties: {
-          description: { type: "string" },
-          specialization: { type: "array", items: { type: "string" } },
-          status: {
-            type: "string",
-            description:
-              "Free-form status: 'available', 'busy', 'out for coffee', etc.",
-          },
+          bio: { type: "string", description: "Your new bio. Pass empty string to clear." },
         },
+        required: ["bio"],
+      },
+    },
+    {
+      name: "set_member_bio",
+      description:
+        "Coordinator-only: rewrite another member's bio in this chat. Backend rejects this call if you are not the coordinator of `chat_id`. Use this to brief a teammate before delegating (e.g. `set_member_bio(chat_id, agent_id, 'auth/sessions focus')`).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "Chat where you are the coordinator." },
+          agent_id: { type: "number", description: "Target agent's id (from list_agents or get_chat)." },
+          bio: { type: "string", description: "New bio for the target. Pass empty string to clear." },
+        },
+        required: ["chat_id", "agent_id", "bio"],
+      },
+    },
+    {
+      name: "add_chat_member",
+      description:
+        "Coordinator-only: pull an EXISTING agent into this chat. The agent must already exist (e.g. one of your owner's other agents discoverable via list_agents at the owner level). For brand-new agents use `spawn_agent` instead. Backend rejects this call if you are not the coordinator of `chat_id`.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "Chat where you are the coordinator." },
+          agent_id: { type: "number", description: "Existing agent's id to add." },
+        },
+        required: ["chat_id", "agent_id"],
+      },
+    },
+    {
+      name: "remove_chat_member",
+      description:
+        "Remove an agent from this chat. Either you (any agent removing yourself) or coordinator-only when removing somebody else. If the target is ephemeral and this was their last chat they're soft-deleted server-side. Use this to kick an unresponsive teammate after a delegation timed out, then `spawn_agent` a replacement.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "Chat id." },
+          agent_id: { type: "number", description: "Agent to remove. Pass your own agent id to leave the chat." },
+        },
+        required: ["chat_id", "agent_id"],
+      },
+    },
+    {
+      name: "spawn_agent",
+      description:
+        "Coordinator-only: create a brand-new ephemeral agent and add them to this chat in one call. The new agent inherits ownership from your owner, so the human behind you can see and manage them in the web UI like any of their own. Returns `auth_token` and a ready-to-paste `onboarding_prompt` — hand those to the human so they can launch a new IDE window for the new agent. The MCP cannot open IDE windows on the host machine itself; the human pastes the prompt into a new Claude Code / Codex terminal to wake the agent up.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "Chat where you are the coordinator." },
+          display_name: { type: "string", description: "User-visible handle for the new agent (must be unique in this chat)." },
+          bio: { type: "string", description: "Optional initial bio for the new agent." },
+        },
+        required: ["chat_id", "display_name"],
       },
     },
     // ===== #6, #11 — tasks =====
@@ -1322,7 +1397,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "chat_messages",
       description:
-        "Get messages from a specific chat with optional filters: limit, before (cursor), since/until (ISO timestamps), unread (only my unread), q (full-text search).",
+        "Get messages from a specific chat with optional filters: limit, before (cursor), since/until (ISO timestamps), unread (only my unread). For full-text search use `search_messages` — it accepts an optional chat_id filter and does the same thing more directly.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1332,7 +1407,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           since: { type: "string", description: "ISO 8601 — only messages at or after" },
           until: { type: "string", description: "ISO 8601 — only messages strictly before" },
           unread: { type: "boolean", description: "Only my unread messages", default: false },
-          q: { type: "string", description: "Full-text search query (websearch syntax: phrases, OR, minus)" },
         },
         required: ["chat_id"],
       },
@@ -1682,17 +1756,120 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (name === "update_profile") {
-    const payload: any = {};
-    if (args?.description !== undefined) payload.description = args.description;
-    if (args?.specialization !== undefined)
-      payload.specialization = args.specialization;
-    if (args?.status !== undefined) payload.status = args.status;
-    const result = await updateProfile(payload);
+    if (typeof args?.bio !== "string") {
+      return {
+        content: [{ type: "text", text: "✗ `bio` must be a string." }],
+        isError: true,
+      };
+    }
+    const result = await updateProfile({ bio: args.bio as string });
+    return {
+      content: [
+        { type: "text", text: `✓ Bio updated:\n${JSON.stringify(result, null, 2)}` },
+      ],
+    };
+  }
+
+  if (name === "set_member_bio") {
+    const chat_id = args?.chat_id;
+    const agent_id = args?.agent_id;
+    const bio = args?.bio;
+    if (typeof chat_id !== "string" || typeof agent_id !== "number" || typeof bio !== "string") {
+      return {
+        content: [{
+          type: "text",
+          text: "✗ Required: chat_id (string), agent_id (number), bio (string).",
+        }],
+        isError: true,
+      };
+    }
+    const result = await setMemberBio(chat_id, agent_id, bio);
+    return {
+      content: [
+        { type: "text", text: `✓ Member bio updated:\n${JSON.stringify(result, null, 2)}` },
+      ],
+    };
+  }
+
+  if (name === "add_chat_member") {
+    const chat_id = args?.chat_id;
+    const agent_id = args?.agent_id;
+    if (typeof chat_id !== "string" || typeof agent_id !== "number") {
+      return {
+        content: [{ type: "text", text: "✗ Required: chat_id (string), agent_id (number)." }],
+        isError: true,
+      };
+    }
+    const result = await addChatMember(chat_id, agent_id);
+    return {
+      content: [
+        { type: "text", text: `✓ Member added:\n${JSON.stringify(result, null, 2)}` },
+      ],
+    };
+  }
+
+  if (name === "remove_chat_member") {
+    const chat_id = args?.chat_id;
+    const agent_id = args?.agent_id;
+    if (typeof chat_id !== "string" || typeof agent_id !== "number") {
+      return {
+        content: [{ type: "text", text: "✗ Required: chat_id (string), agent_id (number)." }],
+        isError: true,
+      };
+    }
+    const result = await removeChatMember(chat_id, agent_id);
+    return {
+      content: [
+        { type: "text", text: `✓ Member removed:\n${JSON.stringify(result, null, 2)}` },
+      ],
+    };
+  }
+
+  if (name === "spawn_agent") {
+    const chat_id = args?.chat_id;
+    const display_name = args?.display_name;
+    const bio = args?.bio;
+    if (typeof chat_id !== "string" || typeof display_name !== "string") {
+      return {
+        content: [{
+          type: "text",
+          text: "✗ Required: chat_id (string), display_name (string). bio is optional.",
+        }],
+        isError: true,
+      };
+    }
+    if (bio !== undefined && typeof bio !== "string") {
+      return {
+        content: [{ type: "text", text: "✗ bio must be a string if provided." }],
+        isError: true,
+      };
+    }
+    const result: any = await spawnAgentInChat(
+      chat_id,
+      display_name,
+      bio as string | undefined,
+    );
+    // Compose a paste-ready onboarding prompt for the new agent. The host
+    // machine is responsible for actually opening a new IDE window — the
+    // MCP can't reach across processes to type into another terminal.
+    const token: string | undefined = result?.auth_token;
+    const newAgentDisplayName: string =
+      result?.display_name || display_name;
+    const onboarding_prompt = token
+      ? `You're being added to an InBetween chat as @${newAgentDisplayName}. ` +
+        `Call \`inbetween.agent_login\` with auth_token="${token}" and you'll be online ` +
+        `in the chat. After login, the server pushes your role, members, and any private ` +
+        `playbook automatically — read those, then go quiet until @-mentioned.`
+      : null;
     return {
       content: [
         {
           type: "text",
-          text: `✓ Profile updated:\n${JSON.stringify(result, null, 2)}`,
+          text:
+            `✓ Agent spawned:\n${JSON.stringify(result, null, 2)}\n\n` +
+            (onboarding_prompt
+              ? `--- ONBOARDING PROMPT (paste into a fresh IDE) ---\n${onboarding_prompt}`
+              : "(no auth_token returned — backend may be misconfigured)"),
         },
       ],
     };
@@ -1738,7 +1915,6 @@ ${JSON.stringify(r, null, 2)}` }] };
       since: args?.since as string | undefined,
       until: args?.until as string | undefined,
       unread: args?.unread as boolean | undefined,
-      q: args?.q as string | undefined,
     });
     // Header: каждый раз когда агент читает чат, мы напоминаем ему:
     //   1. кто здесь и чем занимается (member bio + notify rules);
