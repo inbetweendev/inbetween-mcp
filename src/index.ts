@@ -604,7 +604,12 @@ function connectWebSocket(): void {
         notifyClaudeAboutChatRemoval(event.chat_id, event.formatted_body ?? null).catch((e) => console.error("[inbetween] notify-removal threw:", e));
       } else if (event.type === "wake") {
         notifyClaudeAboutWake(event).catch((e) => console.error("[inbetween] notify-wake threw:", e));
-      } else if (event.type === "task_created" || event.type === "task_assigned" || event.type === "task_updated" || event.type === "task_done") {
+      } else if (event.type === "task_created") {
+        // Direct task_created push only happens for standalone tasks (no
+        // chat_id) where another agent created a task on this agent's
+        // behalf. Chat-bound task events (created/assigned/updated/done/
+        // deleted) arrive as system messages in the chat timeline via
+        // `new_message` — no separate direct push.
         notifyClaudeAboutTask(event).catch((e) => console.error("[inbetween] notify-task threw:", e));
       } else if (event.type === "agent.updated") {
         // Backend broadcasts this when an agent in the chat is renamed
@@ -913,15 +918,11 @@ async function notifyClaudeAboutWake(event: any): Promise<void> {
 
 async function notifyClaudeAboutTask(event: any): Promise<void> {
   try {
-    const verb =
-      event.type === "task_done" ? "marked done" :
-      event.type === "task_updated" ? "updated" :
-      event.type === "task_assigned" ? "assigned to you" :
-      "created";
-    const chatHint = event.chat_id ? ` (chat ${event.chat_id})` : "";
+    // Only `task_created` for standalone (no-chat) tasks reaches this path —
+    // chat-bound task events arrive as system messages in the chat timeline.
     const fallback =
-      `🗒 Task #${event.task_id} ${verb} by @${event.from_agent}${chatHint}: ${event.title}\n\n` +
-      `Call \`tasks_list\` to see details. When you finish work on a task, ALWAYS call \`tasks_upsert(id=${event.task_id}, status="done")\` so the chat sees you closed it.`;
+      `🗒 Task #${event.task_id} created by @${event.from_agent}: ${event.title}\n\n` +
+      `Call \`tasks_list\` to see details. When you finish work on a task, ALWAYS call \`tasks_upsert(id=${event.task_id}, status="done")\` so it gets marked closed.`;
     await server.notification({
       method: "notifications/claude/channel",
       params: {
@@ -1076,7 +1077,13 @@ async function listTasks(status?: string, limit = 50) {
   return api("GET", `/tasks${qs}`);
 }
 async function createTask(payload: {
-  title: string; body?: string; priority?: number; due_at?: string; agent_name?: string;
+  title: string;
+  description?: string;
+  due?: string;
+  agent_name?: string;
+  assignee?: string;
+  chat_id?: number;
+  completion_note?: string;
 }) {
   return api("POST", "/tasks", payload);
 }
@@ -1167,13 +1174,13 @@ const server = new Server(
     instructions:
       "InBetween — direct line between AI agents working as the owner's team. Treat the chat like a Telegram group with motivated teammates, not a corporate channel.\n\n" +
       "1. ALWAYS reply via `chat_send`. The InBetween chat is the ONLY surface the owner sees — console output is invisible to him, so a console-only reply is silence. Console may follow chat_send for IDE UX, never replace it.\n\n" +
-      "2. Talk plainly. Short, casual, to the point — like coworkers in a group chat, not a status report. No corporate/formal phrasing, no posturing as smarter than you are. Other agents have the same tools and intelligence as you; treat them as equals, don't think for them, don't redo their lane.\n\n" +
-      "3. Save the owner's tokens. One substantive message beats five tiny pings. Multiple `chat_send` calls ARE fine when each carries real content for different recipients (e.g. coordinator delegating to several agents at once) — just don't fragment small talk.\n\n" +
+      "2. Teammate tone, save the owner's tokens. Short, plain, casual — like coworkers in a group chat, not a status report. No corporate/formal phrasing, no posturing. No sycophancy: drop \"you're absolutely right\" / \"great point\" — say what's true or just act. When work is done, say \"done\" and stop; don't pad with extra suggestions. One substantive message beats five tiny pings; bundle clarification questions into one message, not three. Multiple `chat_send` calls ARE fine when each carries real content for different recipients (e.g. coordinator delegating to several agents at once). Other agents have the same tools and intelligence as you — treat them as equals, don't think for them, don't redo their lane.\n\n" +
+      "3. Honesty over agreement. Push back when you disagree (with the owner OR another agent); don't validate to be polite. Don't claim \"done\" until you actually ran/checked it — if verification wasn't possible, say so plainly. State load-bearing assumptions out loud before non-trivial work. If you spot something that affects another agent (changed contract, new error path, blocker upstream), drop a one-liner in chat unprompted.\n\n" +
       "4. Wake-up routing. The server already filtered who to wake; if you got pushed, READ the message — even if your @handle isn't spelled exactly (someone may have used your old nick). If it's clearly for someone else, stay quiet (coordinator routes unaddressed traffic); if it's for you, reply.\n\n" +
-      "5. Stay in your lane (designer → design, backend → backend, marketer → marketing, etc.) and don't grab work that belongs to someone else. EXCEPTION: if a needed role isn't covered in this chat, agree among yourselves who picks it up. Coordinators: if you can spawn an agent for the gap, prefer that over absorbing the work.\n\n" +
-      "6. Don't block on others. Other agents may be offline, busy, or broken — do everything in your power in parallel. Push forward on what depends on you; escalate or wait only when truly stuck.\n\n" +
+      "5. Stay in lane; don't block, don't collide. Designer → design, backend → backend, marketer → marketing, etc. If a needed role isn't covered in the chat, agree who picks it up; coordinators can spawn an agent for the gap and should delegate SCOPE, not steps (goal + acceptance criterion, trust the specialist with the algorithm). If you're about to build something that conflicts with another agent's approach, escalate to the coordinator/owner BEFORE both implement. Other agents may be offline/busy/broken — do everything in your power in parallel, escalate only when truly stuck.\n\n" +
+      "6. Visibility on long work + clean handoffs. Don't go dark — on tasks longer than a few minutes, post one mid-progress update (done / left / blockers). When you delegate, include concrete context (file path, error text, constraint), not \"see above\". When you finish delegated work, name the artifact (branch, commit, file), not just \"done\".\n\n" +
       "7. Local-file safety. Before touching files on disk, confirm which folder & machine each agent is on. Two agents in the same cwd on the same host WILL clobber each other. Ask in chat if unsure, and publish your own cwd via `set_chat_settings(bio=...)` so other agents can see it.\n\n" +
-      "8. Track work via tasks. BEFORE non-trivial work — `tasks_upsert(title=..., status=\"pending\", chat_id=<chat>)`. ON finish — `tasks_upsert(id=..., status=\"done\")`. WHEN delegating to another agent — `tasks_upsert(title=..., assignee_agent_id=<their id>, chat_id=<chat>)` BEFORE @-mentioning them (they get a personal push and a tracked task). ON entering a chat or after restart — `tasks_list`. Coordinators delegate often; this is mandatory for them.\n\n" +
+      "8. Track work via tasks. BEFORE non-trivial work — `tasks_upsert(title=..., status=\"todo\", chat_id=<chat>)`. ON finish — `tasks_upsert(id=..., status=\"done\")`. WHEN delegating to another agent — `tasks_upsert(title=..., assignee=\"<their handle>\", chat_id=<chat>)` BEFORE @-mentioning them. Note: assignees are NOT pushed personally — they see the assignment as a system event in the chat. ON entering a chat or after restart — `tasks_list`. Coordinators delegate often; this is mandatory for them.\n\n" +
       "9. Files in pushes appear as a `📎 N attachments:` block — call `attachment_download(message_id, index)` for a fresh 10-min signed URL, then WebFetch the bytes. To send a file: `attachment_send(chat_id, content, local_path)` (uploads + posts atomically; ≤25MB; image/png|jpeg|webp|gif, application/pdf|json, text/plain|markdown).",
     capabilities: {
       // listChanged: true — server announces that it will emit
@@ -1277,11 +1284,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "tasks_list",
       description:
-        "List YOUR tasks (where you are owner OR assignee). CALL THIS when entering a chat where you are a member, when you receive a `task_*` push notification, or before starting any work the owner asked for — to make sure nothing is already tracked. Filter by status: pending|in_progress|done.",
+        "List YOUR tasks (where you are owner OR assignee). CALL THIS when entering a chat where you are a member, when you receive a `task_*` system event, or before starting any work the owner asked for — to make sure nothing is already tracked. Filter by status: todo|in_progress|done.",
       inputSchema: {
         type: "object",
         properties: {
-          status: { type: "string", enum: ["pending", "in_progress", "done"] },
+          status: { type: "string", enum: ["todo", "in_progress", "done"] },
           limit: { type: "number", default: 50 },
         },
       },
@@ -1289,19 +1296,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "tasks_upsert",
       description:
-        "Create or update a task. CALL THIS in three situations: (1) before you start a piece of work — create a `pending` task so the chat can see what you're doing; (2) when you finish — update with status='done' so members see it closed; (3) when you delegate work to another agent — create a task with `assignee_agent_id` so they get a personal push. If `id` is set → update; if `id` is omitted → create. Tasks bound to `chat_id` appear as system events in the chat timeline AND push every member.",
+        "Create or update a task. CALL THIS in three situations: (1) before you start a piece of work — create a `todo` task so the chat can see what you're doing; (2) when you finish — update with status='done' so members see it closed; (3) when you delegate work to another agent — create a task with `assignee` (their @-handle) so the chat sees them assigned. If `id` is set → update; if `id` is omitted → create. Tasks bound to `chat_id` appear as system events in the chat timeline (task_created / task_assigned / task_updated / task_done / task_deleted) — assignees are NOT pushed personally, they see the event in the chat like everyone else.",
       inputSchema: {
         type: "object",
         properties: {
           id: { type: "number", description: "Task id to update; omit to create" },
           title: { type: "string" },
-          body: { type: "string" },
-          status: { type: "string", enum: ["pending", "in_progress", "done"] },
-          priority: { type: "number", default: 0 },
-          due_at: { type: "string", description: "ISO 8601" },
+          description: { type: "string", description: "Free-text body of the task" },
+          status: { type: "string", enum: ["todo", "in_progress", "done"] },
+          due: { type: "string", description: "Date in YYYY-MM-DD form (no time component)" },
           agent_name: { type: "string", description: "Owner agent of the task (create only; default: yourself)" },
-          assignee_agent_id: { type: "number", description: "Explicit executor agent id (optional, can differ from owner)" },
-          chat_id: { type: "number", description: "Attach task to a chat (optional)" },
+          assignee: { type: "string", description: "Executor agent's @-handle (string). Pass empty string to unassign on PATCH." },
+          chat_id: { type: "number", description: "Attach task to a chat (optional but recommended — without it the task is invisible to chat members)" },
+          completion_note: { type: "string", description: "Optional 'what was done' note when closing a task (≤1000 chars)" },
         },
       },
     },
@@ -1657,11 +1664,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           `Your per-chat role, bio, and private playbook for every chat you're in are now exposed via the \`inbetween_chat_context\` tool's description — re-read that block whenever you respond, and it will refresh automatically when settings change.\n\n` +
           `**Team vibe + mandatory rules — read before replying:**\n` +
           `  1. Every reply to an InBetween push goes through \`chat_send\` first. Console output is invisible to the owner; a console-only reply = silence on his side.\n` +
-          `  2. Talk like a teammate in a group chat — short, plain, casual. No corporate phrasing, no posturing. Save the owner's tokens: one substantive message beats five tiny pings. Multiple chat_sends are fine when each carries real content for different recipients.\n` +
-          `  3. The server already filtered who to wake. If you got pushed, READ the message — even if your @handle was spelled differently (e.g. old nick). If it's for you, reply; if clearly for someone else, stay quiet (coordinator routes).\n` +
-          `  4. Stay in your lane and don't block on others — they may be offline/busy/broken. Do everything in your power in parallel. Other agents are as smart as you and have the same tools — don't think for them. If a needed role is missing in this chat, agree among yourselves; coordinators may spawn an agent for the gap.\n` +
-          `  5. Before touching local files, confirm which folder & machine each agent is on — same cwd + same host = clobber risk. Publish your cwd via \`set_chat_settings(bio=...)\` so others can see it.\n` +
-          `  6. Track work via tasks. BEFORE non-trivial work — \`tasks_upsert(title=..., status="pending", chat_id=<chat>)\`. ON finish — \`tasks_upsert(id=..., status="done")\`. WHEN delegating — \`tasks_upsert(assignee_agent_id=<id>, chat_id=<chat>)\` BEFORE @-mentioning. ON entering a chat — \`tasks_list\`. Silent work is invisible work.`,
+          `  2. Teammate tone — short, plain, casual. No corporate phrasing, no sycophancy ("you're absolutely right", "great point" — drop it; say what's true or just act). When done, say "done" and stop; don't pad with extra suggestions. One substantive message beats five tiny pings; bundle clarification questions. Multiple chat_sends are fine when each carries real content for different recipients.\n` +
+          `  3. Honesty: push back when you disagree (with owner OR another agent), don't validate to be polite. Don't claim "done" until you actually ran/checked it — say plainly if verification wasn't possible. State load-bearing assumptions out loud before non-trivial work. If you spot something that affects another agent (changed contract, new error path, blocker upstream), drop a one-liner in chat unprompted.\n` +
+          `  4. Read every push even if @${visibleName} wasn't spelled exactly (e.g. old nick). Reply if for you; stay quiet if clearly for someone else (coordinator routes).\n` +
+          `  5. Stay in lane; don't block; don't collide. Other agents have the same tools and intelligence as you — don't think for them, don't redo their lane. Do everything in your power in parallel — others may be offline/broken. If roles are missing, agree among yourselves; coordinators may spawn an agent for the gap and should delegate SCOPE (goal + acceptance criterion), not steps. If you're about to build something that conflicts with another agent's approach, escalate to coordinator/owner BEFORE both implement.\n` +
+          `  6. Don't go dark on long work — post one mid-progress update (done / left / blockers). Handoffs include concrete context (path/error/constraint), not "see above". On finish of delegated work, name the artifact (branch / commit / file), not just "done".\n` +
+          `  7. Before touching local files, confirm cwd & host — same cwd + same host = clobber risk. Publish your cwd via \`set_chat_settings(bio=...)\`.\n` +
+          `  8. Track work via tasks. BEFORE non-trivial work — \`tasks_upsert(title=..., status="todo", chat_id=<chat>)\`. ON finish — \`tasks_upsert(id=..., status="done")\`. WHEN delegating — \`tasks_upsert(assignee="<handle>", chat_id=<chat>)\` BEFORE @-mentioning. ON entering a chat — \`tasks_list\`. Silent work is invisible work.`,
       }],
     };
   }
@@ -1700,7 +1709,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 if (name === "tasks_upsert") {
     const id = args?.id as number | undefined;
     const payload: any = {};
-    for (const k of ["title", "body", "status", "priority", "due_at", "agent_name", "assignee_agent_id", "chat_id"]) {
+    for (const k of ["title", "description", "status", "due", "agent_name", "assignee", "chat_id", "completion_note"]) {
       if (args?.[k] !== undefined) payload[k] = args[k];
     }
     if (id != null) {
