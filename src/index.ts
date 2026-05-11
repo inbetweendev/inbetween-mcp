@@ -331,6 +331,104 @@ const inbox: Message[] = [];
 const MAX_INBOX_SIZE = 100;
 
 // =================================================================
+// PERSISTENT CHAT-CONTEXT BLOCK
+// =================================================================
+// The per-chat playbook (chat_members.instructions), bio, and the agent's
+// is_coordinator flag used to ride along with every message push as a
+// [System context] block. That bloated the model's context window — same
+// ~500-1000 tokens duplicated N times per chat.
+//
+// Now those fields live in the description of a no-op tool below
+// (`inbetween_chat_context`). MCP fetches them once on agent_login and
+// refreshes via `notifications/tools/list_changed` whenever the backend
+// signals a change (`chat_member_settings_updated`, `coordinator_changed`).
+// Claude Code re-reads the tools list and the updated context appears in
+// the system area — one copy, always current.
+let chatContextDescription: string =
+  "InBetween: agent-specific per-chat context (your handle, role, bio, private playbook) will appear here after `agent_login`. " +
+  "Calling this tool is a no-op — its description IS the data. Re-read it whenever you need to recall your role in any chat.";
+
+interface ChatContextEntry {
+  chat_id: number;
+  chat_title: string | null;
+  my_display_name: string | null;
+  is_coordinator: boolean;
+  coordinator_agent_id: number | null;
+  coordinator_display_name: string | null;
+  bio: string | null;
+  instructions: string | null;
+}
+
+function formatChatContext(entries: ChatContextEntry[]): string {
+  if (entries.length === 0) {
+    return (
+      "InBetween: you are not a member of any chat yet. " +
+      "(Calling this tool is a no-op — the description above is the data.)"
+    );
+  }
+  const lines: string[] = [];
+  lines.push(
+    "InBetween — your active context across all chats you're in. This block updates automatically when you (or the owner) edit a chat-member setting, or when a coordinator is reassigned. Treat it as a permanent system instruction: refer back to it whenever you reply.",
+    "",
+    "Calling this tool itself is a NO-OP — the data IS the description below.",
+    "",
+  );
+  for (const e of entries) {
+    const title = e.chat_title ? `"${e.chat_title}"` : "(untitled)";
+    lines.push(`=== Chat #${e.chat_id} — ${title} ===`);
+    lines.push(`  Your handle here: @${e.my_display_name || "?"}`);
+    if (e.is_coordinator) {
+      lines.push(
+        `  Your role: COORDINATOR. Messages sent to this chat WITHOUT @-mentions land on you — triage them and delegate via @<display_name> mentions.`,
+      );
+    } else if (e.coordinator_display_name) {
+      lines.push(
+        `  Your role: regular member. Coordinator is @${e.coordinator_display_name} — unaddressed traffic goes to them, not to you.`,
+      );
+    } else {
+      lines.push(`  Your role: regular member. (No coordinator set.)`);
+    }
+    if (e.bio && e.bio.trim()) {
+      lines.push(`  Your bio (public — visible to other members):`);
+      for (const ln of e.bio.split("\n")) lines.push(`    ${ln}`);
+    }
+    if (e.instructions && e.instructions.trim()) {
+      lines.push(`  Your private playbook (only you see this):`);
+      for (const ln of e.instructions.split("\n")) lines.push(`    ${ln}`);
+    }
+    lines.push("");
+  }
+  lines.push(
+    "(Edit your bio or playbook with `set_chat_settings(chat_id, bio=..., instructions=...)`. This block refreshes automatically — no need to re-login.)",
+  );
+  return lines.join("\n");
+}
+
+async function refreshChatContext(): Promise<void> {
+  if (!activeAgentToken) return;
+  try {
+    const res = await signedFetch(`${BACKEND_URL}/agents/me/chats/context`, {
+      headers: { Authorization: `Bearer ${activeAgentToken}` },
+    });
+    if (!res.ok) {
+      console.error(`[inbetween] context refresh: HTTP ${res.status}`);
+      return;
+    }
+    const data: any = await res.json();
+    const entries: ChatContextEntry[] = Array.isArray(data?.chats) ? data.chats : [];
+    chatContextDescription = formatChatContext(entries);
+    try {
+      await server.notification({ method: "notifications/tools/list_changed" });
+      console.error(`[inbetween] context refresh: ${entries.length} chat(s), tools/list_changed sent`);
+    } catch (e: any) {
+      console.error(`[inbetween] context refresh: list_changed notify failed: ${e?.message || e}`);
+    }
+  } catch (e: any) {
+    console.error(`[inbetween] context refresh failed: ${e?.message || e}`);
+  }
+}
+
+// =================================================================
 // WEBSOCKET CONNECTION
 // =================================================================
 let ws: WebSocket | null = null;
@@ -372,6 +470,12 @@ function connectWebSocket(): void {
 
   ws.on("open", () => {
     console.error(`[inbetween] WS OPEN as @${activeAgentName} (id=${activeAgentId}) → ${WS_URL}`);
+    // Re-sync chat-context block. Owner may have toggled coordinator or
+    // edited the playbook while we were disconnected; refreshing here
+    // closes that gap before any new push lands.
+    refreshChatContext().catch((e) =>
+      console.error(`[inbetween] WS-open context refresh failed: ${e?.message || e}`),
+    );
     setInterval(() => {
       if (ws?.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "heartbeat" }));
@@ -494,6 +598,15 @@ function connectWebSocket(): void {
         // shifted. Agents should re-check `list_agents` / `tasks_list` when
         // someone new joins or leaves.
         notifyClaudeAboutMemberChange(event).catch((e) => console.error("[inbetween] notify-member-change threw:", e));
+      } else if (event.type === "chat_member_settings_updated" || event.type === "coordinator_changed") {
+        // The persistent chat-context block (inbetween_chat_context tool
+        // description) carries per-chat bio, private playbook, and the
+        // is_coordinator flag. When either changes server-side, refresh
+        // and emit notifications/tools/list_changed so Claude Code
+        // re-reads the description without the user having to relogin.
+        refreshChatContext().catch((e) =>
+          console.error(`[inbetween] WS-triggered context refresh threw: ${e?.message || e}`),
+        );
       } else if (event.type === "heartbeat_ack") {
         // OK
       }
@@ -534,28 +647,14 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
   try {
     const meta = (msg.metadata as any) || {};
     // Server-rendered fast path: backend >= 0.4.0 always sets
-    // formatted_body. We forward it verbatim plus inject the chat-scoped
-    // [System context] block (effective_prompt) which IS still client-
-    // side because it lives in the IDE's session prompt, not the
-    // notification body. Pre-0.4.0 backends fall through to the legacy
-    // templating below — those bundles can no longer reach a current
-    // backend (version gate), so this branch is effectively dead in
-    // production, kept only so the file still compiles cleanly without
-    // the new event field.
+    // formatted_body. We forward it verbatim plus a one-line handle
+    // reminder. The persistent per-chat playbook + bio + is_coordinator
+    // now lives in the `inbetween_chat_context` tool description — no
+    // longer prepended to every push.
     if (msg.formatted_body) {
-      const eff = (meta.effective_prompt as { system_prompt?: string | null; persona?: string | null } | null) || null;
       const currentHandle = (meta.recipient_display_name as string | null | undefined) || activeAgentName;
-      const ctxParts: string[] = [];
-      if (currentHandle) {
-        ctxParts.push(
-          `Your current handle in this chat is @${currentHandle}. ` +
-          `Reply ONLY when @${currentHandle} or @all is mentioned, even if your original onboarding prompt referenced a different name.`,
-        );
-      }
-      if (eff?.persona) ctxParts.push(`Persona: ${eff.persona}`);
-      if (eff?.system_prompt) ctxParts.push(eff.system_prompt);
-      const ctxBlock = ctxParts.length
-        ? `[System context for this chat — apply when replying]\n${ctxParts.join("\n\n")}\n[End system context]\n\n`
+      const ctxBlock = currentHandle
+        ? `(Your handle in this chat: @${currentHandle}. Reply only when @${currentHandle} or @all is mentioned. Full role/bio/playbook: \`inbetween_chat_context\` tool description.)\n\n`
         : "";
       await server.notification({
         method: "notifications/claude/channel",
@@ -607,32 +706,24 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
         lines.join("\n") +
         `\n(call \`attachment_download(message_id="${msg.message_id}", index=N)\` to fetch any of them — returns a fresh signed URL with a 10-minute TTL)`;
     }
-    // Inject effective_prompt (global system_prompt + persona + chat playbook)
-    // as a system-context block ABOVE the message. Backend already merged
-    // chat_members.instructions ("Private playbook") into system_prompt.
-    const eff = (meta.effective_prompt as { system_prompt?: string | null; persona?: string | null } | null) || null;
-    // Always lead with the agent's *current* handle so behavior rules from
-    // the original onboarding prompt (which baked in the old name) get
-    // overridden if the owner has since renamed the agent.
+    // The per-chat playbook + bio + is_coordinator now live permanently in
+    // the `inbetween_chat_context` tool description (refreshed via
+    // tools/list_changed on changes). Re-injecting effective_prompt per
+    // push duplicated 500-1000 tokens N times per chat — removed.
+    //
+    // We still surface the agent's *current* handle here as a one-line
+    // reminder: this overrides any handle baked into the original
+    // onboarding prompt if the owner renamed the agent since.
     const currentHandle = (meta.recipient_display_name as string | null | undefined) || activeAgentName;
-    const parts: string[] = [];
-    if (currentHandle) {
-      parts.push(
-        `Your current handle in this chat is @${currentHandle}. ` +
-        `Reply ONLY when @${currentHandle} or @all is mentioned, even if your original onboarding prompt referenced a different name (the owner may have renamed you).`,
-      );
-    }
-    if (eff?.persona) parts.push(`Persona: ${eff.persona}`);
-    if (eff?.system_prompt) parts.push(eff.system_prompt);
-    const contextBlock = parts.length
-      ? `[System context for this chat — apply when replying]\n${parts.join("\n\n")}\n[End system context]\n\n`
+    const handleReminder = currentHandle
+      ? `(Your handle in this chat: @${currentHandle}. Reply only when @${currentHandle} or @all is mentioned. Full role/bio/playbook: see the \`inbetween_chat_context\` tool description.)\n\n`
       : "";
-    // Order: [system context] → [action header] → [message header] →
+    // Order: [handle reminder] → [action header] → [message header] →
     // [content] → [attachments] → [message_id footer]. The action header
     // sits BEFORE the content so the model sees the tool requirement
     // before processing the message body.
     const channelContent =
-      `${contextBlock}${actionHeader}` +
+      `${handleReminder}${actionHeader}` +
       `📨 New message via InBetween from ${sender}${humansOnlyTag}:\n\n${msg.content}` +
       `${attachmentBlock}\n\n(message_id: ${msg.message_id})`;
     await server.notification({
@@ -1074,6 +1165,15 @@ const server = new Server(
 // === TOOLS ===
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
+    // ===== Persistent chat-context block =====
+    // No-op tool whose *description* is the per-chat state (role, bio,
+    // playbook) for the logged-in agent. Refreshed dynamically — see
+    // refreshChatContext() / notifications/tools/list_changed.
+    {
+      name: "inbetween_chat_context",
+      description: chatContextDescription,
+      inputSchema: { type: "object", properties: {} },
+    },
     // ===== Layer 0 — owner-level auth =====
     {
       name: "owner_login",
@@ -1330,7 +1430,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 // Tool name → required layer.
-const LAYER0_TOOLS = new Set(["owner_login", "owner_logout", "whoami"]);
+// inbetween_chat_context is a description-only tool; calling it is a no-op
+// but allowed at any layer so Claude can re-read the block even before
+// agent_login (placeholder text guides the user to log in).
+const LAYER0_TOOLS = new Set([
+  "owner_login", "owner_logout", "whoami",
+  "inbetween_chat_context",
+]);
 const LAYER1_TOOLS = new Set(["agent_login", "agent_logout"]);
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -1347,6 +1453,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       console.error(`[inbetween] TOOL_CALL gate-fail id=${callId} name=${name} err=${err}`);
       return { content: [{ type: "text", text: `✗ ${err}` }], isError: true };
     }
+  }
+
+  // ===== Persistent context (no-op) =====
+  // The data is the description in the tools list. Returning it here lets
+  // Claude force-read the block on demand (e.g. after a long quiet period
+  // where the system context may have been compacted out).
+  if (name === "inbetween_chat_context") {
+    return { content: [{ type: "text", text: chatContextDescription }] };
   }
 
   // ===== Layer 0 — owner auth =====
@@ -1482,11 +1596,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     saveSession(tok, visibleName, activeAgentId);
     try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch {}
     connectWebSocket();
+    // Populate the persistent chat-context tool description with this
+    // agent's per-chat bio / playbook / coordinator status, and notify
+    // Claude Code so it re-reads the tool list. Fire-and-forget — login
+    // must succeed even if the context endpoint is briefly unhappy.
+    refreshChatContext().catch((e) =>
+      console.error(`[inbetween] post-login context refresh failed: ${e?.message || e}`),
+    );
     return {
       content: [{
         type: "text",
         text:
           `✓ Acting as @${visibleName} (id=${activeAgentId}). Use list_chats to see chats you're in.\n\n` +
+          `Your per-chat role, bio, and private playbook for every chat you're in are now exposed via the \`inbetween_chat_context\` tool's description — re-read that block whenever you respond, and it will refresh automatically when settings change.\n\n` +
           `**Mandatory rules — read these before any reply:**\n` +
           `  1. Every reply to an InBetween push goes through \`chat_send\` first. The console is invisible to the owner; a console-only reply = silence on their side.\n` +
           `  2. Reply only when @${visibleName} or @all is in the message. No mention → stay silent (coordinator routes work).\n` +
@@ -1776,6 +1898,14 @@ ${JSON.stringify(r, null, 2)}` }] };
       bio: args?.bio as string | undefined,
       instructions: args?.instructions as string | undefined,
     });
+    // Local instant refresh: backend will ALSO push `chat_member_settings_updated`
+    // via WS, but that has network round-trip latency. Refreshing here closes
+    // the loop immediately so the next reply already uses the new playbook/bio.
+    if (args?.bio !== undefined || args?.instructions !== undefined) {
+      refreshChatContext().catch((e) =>
+        console.error(`[inbetween] post-set_chat_settings context refresh threw: ${e?.message || e}`),
+      );
+    }
     return { content: [{ type: "text", text: `✓ Settings saved for chat ${args!.chat_id}` }] };
   }
   if (name === "inbox_unread") {
