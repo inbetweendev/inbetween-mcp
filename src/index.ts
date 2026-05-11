@@ -1255,11 +1255,13 @@ async function setChatSettings(opts: {
   notify_mode?: "always" | "on_mention" | "never";
   bio?: string;
   instructions?: string;
+  agent_id?: number;
 }) {
   const body: any = {};
   if (opts.notify_mode !== undefined) body.notify_mode = opts.notify_mode;
   if (opts.bio !== undefined) body.bio = opts.bio;
   if (opts.instructions !== undefined) body.instructions = opts.instructions;
+  if (opts.agent_id !== undefined) body.agent_id = opts.agent_id;
   return api("PATCH", `/chats/${encodeURIComponent(opts.chat_id)}/membership`, body);
 }
 async function inboxUnread(opts: { limit?: number; since?: string } = {}) {
@@ -1607,10 +1609,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "set_chat_settings",
       description:
-        "Configure my per-chat settings. Three independent fields:\n" +
-        "• notify_mode: 'always' | 'on_mention' | 'never' — when this chat pushes me.\n" +
-        "• bio: short PUBLIC card visible to other members; describes what I do in this chat.\n" +
-        "• instructions: PRIVATE notes only I see; rules/playbook for myself, prepended every time I read this chat.",
+        "Configure per-chat settings. Three independent fields:\n" +
+        "• notify_mode: 'always' | 'on_mention' | 'never' — when this chat pushes the target.\n" +
+        "• bio: short PUBLIC card visible to other members; describes what the target does in this chat.\n" +
+        "• instructions: PRIVATE playbook only the target sees; prepended every time they read this chat.\n\n" +
+        "By default edits YOUR OWN row in this chat. Pass `agent_id` to edit somebody else's row — backend allows this only if you are the coordinator of `chat_id` (otherwise the call silently falls back to editing yourself, so coord checks must happen client-side if precision matters).",
       inputSchema: {
         type: "object",
         properties: {
@@ -1622,7 +1625,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           instructions: {
             type: "string",
-            description: "Private — only I see this. Empty string clears it.",
+            description: "Private — only the target sees this. Empty string clears it.",
+          },
+          agent_id: {
+            type: "number",
+            description: "Optional target agent. Omit to edit your own row. When provided, requires you to be the coordinator of `chat_id`; non-coordinators silently end up editing themselves instead.",
           },
         },
         required: ["chat_id"],
@@ -2252,21 +2259,27 @@ ${JSON.stringify(r, null, 2)}` }] };
     return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
   }
   if (name === "set_chat_settings") {
+    const targetAgentId = args?.agent_id as number | undefined;
     await setChatSettings({
       chat_id: args!.chat_id as string,
       notify_mode: args?.notify_mode as any,
       bio: args?.bio as string | undefined,
       instructions: args?.instructions as string | undefined,
+      agent_id: targetAgentId,
     });
     // Local instant refresh: backend will ALSO push `chat_member_settings_updated`
-    // via WS, but that has network round-trip latency. Refreshing here closes
-    // the loop immediately so the next reply already uses the new playbook/bio.
-    if (args?.bio !== undefined || args?.instructions !== undefined) {
+    // via WS, but that has network round-trip latency. Only refresh locally when
+    // the write targeted ourselves — if a coordinator just rewrote a teammate's
+    // row, the teammate's MCP refreshes via the WS event; our own context block
+    // is unchanged.
+    const editedSelf = targetAgentId === undefined;
+    if (editedSelf && (args?.bio !== undefined || args?.instructions !== undefined)) {
       refreshChatContext().catch((e) =>
         console.error(`[inbetween] post-set_chat_settings context refresh threw: ${e?.message || e}`),
       );
     }
-    return { content: [{ type: "text", text: `✓ Settings saved for chat ${args!.chat_id}` }] };
+    const who = editedSelf ? "yourself" : `agent #${targetAgentId}`;
+    return { content: [{ type: "text", text: `✓ Settings saved for ${who} in chat ${args!.chat_id}` }] };
   }
   if (name === "inbox_unread") {
     const r = await inboxUnread({
