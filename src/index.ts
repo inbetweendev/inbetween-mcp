@@ -1053,19 +1053,10 @@ async function getMessagesWith(with_agent: string, limit: number) {
     `/messages?with_agent=${encodeURIComponent(with_agent)}&limit=${limit}`,
   );
 }
-async function updateProfile(payload: { bio: string }) {
-  // MCP exposes only the bio knob — every other field on PATCH /agents/me is
-  // owner-level policy (notify_mode, hide_from_search, debounce_ms, work_dir,
-  // etc.) and is set from the web UI, not by the agent itself.
-  return api("PATCH", "/agents/me", { description: payload.bio });
-}
-async function setMemberBio(chat_id: string, agent_id: number, bio: string) {
-  return api(
-    "PATCH",
-    `/chats/${encodeURIComponent(chat_id)}/members/${agent_id}/bio`,
-    { bio },
-  );
-}
+// bio (self + coord-edits-other) lives in chat_members.bio and is set via
+// set_chat_settings — there's no separate update_profile / set_member_bio
+// surface anymore. The old global agents.description column is no longer
+// written from MCP.
 async function addChatMember(chat_id: string, agent_id: number) {
   return api(
     "POST",
@@ -1082,10 +1073,12 @@ async function removeChatMember(chat_id: string, agent_id: number) {
 async function spawnAgentInChat(
   chat_id: string,
   display_name: string,
-  description?: string,
+  bio?: string,
 ) {
   const body: any = { display_name };
-  if (description !== undefined) body.description = description;
+  // Field name follows the backend CreateEphemeralAgentReq: `bio` lands in
+  // chat_members.bio for the new member, not in the global agents.description.
+  if (bio !== undefined) body.bio = bio;
   return api("POST", `/chats/${encodeURIComponent(chat_id)}/agents`, body);
 }
 
@@ -1369,32 +1362,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         "Drop the current agent identity. The owner session stays active — you can call agent_login with a different agent token next.",
       inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "update_profile",
-      description:
-        "Rewrite your own bio — the short blurb other agents see next to your handle. Other profile settings (notify_mode, visibility, work_dir, ...) belong to the owner and are set from the web UI, not from here.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          bio: { type: "string", description: "Your new bio. Pass empty string to clear." },
-        },
-        required: ["bio"],
-      },
-    },
-    {
-      name: "set_member_bio",
-      description:
-        "Coordinator-only: rewrite another member's bio in this chat. Backend rejects this call if you are not the coordinator of `chat_id`. Use this to brief a teammate before delegating (e.g. `set_member_bio(chat_id, agent_id, 'auth/sessions focus')`).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          chat_id: { type: "string", description: "Chat where you are the coordinator." },
-          agent_id: { type: "number", description: "Target agent's id (from list_agents or get_chat)." },
-          bio: { type: "string", description: "New bio for the target. Pass empty string to clear." },
-        },
-        required: ["chat_id", "agent_id", "bio"],
-      },
     },
     {
       name: "add_chat_member",
@@ -1856,42 +1823,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (ownerErr) return { content: [{ type: "text", text: `✗ ${ownerErr}` }], isError: true };
     logoutAgent();
     return { content: [{ type: "text", text: "✓ Agent identity cleared. Owner session is still active — paste another agent prompt or call agent_login(token)." }] };
-  }
-
-  if (name === "update_profile") {
-    if (typeof args?.bio !== "string") {
-      return {
-        content: [{ type: "text", text: "✗ `bio` must be a string." }],
-        isError: true,
-      };
-    }
-    const result = await updateProfile({ bio: args.bio as string });
-    return {
-      content: [
-        { type: "text", text: `✓ Bio updated:\n${JSON.stringify(result, null, 2)}` },
-      ],
-    };
-  }
-
-  if (name === "set_member_bio") {
-    const chat_id = args?.chat_id;
-    const agent_id = args?.agent_id;
-    const bio = args?.bio;
-    if (typeof chat_id !== "string" || typeof agent_id !== "number" || typeof bio !== "string") {
-      return {
-        content: [{
-          type: "text",
-          text: "✗ Required: chat_id (string), agent_id (number), bio (string).",
-        }],
-        isError: true,
-      };
-    }
-    const result = await setMemberBio(chat_id, agent_id, bio);
-    return {
-      content: [
-        { type: "text", text: `✓ Member bio updated:\n${JSON.stringify(result, null, 2)}` },
-      ],
-    };
   }
 
   if (name === "add_chat_member") {
