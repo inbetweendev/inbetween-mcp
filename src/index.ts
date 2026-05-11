@@ -16,6 +16,7 @@ import WebSocket from "ws";
 import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, appendFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+import { spawn as childSpawn } from "child_process";
 
 // =================================================================
 // FILE LOGGING — mirror everything we'd write to stderr into
@@ -1087,6 +1088,84 @@ async function spawnAgentInChat(
   if (description !== undefined) body.description = description;
   return api("POST", `/chats/${encodeURIComponent(chat_id)}/agents`, body);
 }
+
+// =================================================================
+// LAUNCH NEW IDE WINDOW
+// Used by `spawn_agent` with auto_launch=true to actually pop a fresh
+// Claude Code window in a target folder, with the onboarding prompt
+// already passed as the first positional arg. Claude Code accepts the
+// initial prompt that way (`claude "<prompt>"`) — it stays interactive
+// and the prompt becomes the first user message, which is exactly what
+// makes the new agent autonomously call agent_login on startup.
+//
+// We never use `shell: true`; argv arrays go to spawn directly, so we
+// only need per-platform string quoting (not shell-meta escaping).
+// =================================================================
+
+function shQuoteUnix(s: string): string {
+  // Wrap in single quotes; embed internal single quotes via `'\''` dance.
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+function shQuoteWindowsCmd(s: string): string {
+  // cmd.exe: wrap in double quotes, escape internal `"` by doubling.
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+function appleScriptEscape(s: string): string {
+  // Embedding inside an AppleScript double-quoted string literal —
+  // escape backslashes first, then quotes.
+  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+interface LaunchResult {
+  ok: boolean;
+  platform: NodeJS.Platform;
+  command_summary?: string;
+  error?: string;
+}
+
+function launchClaudeInNewWindow(
+  cwd: string,
+  prompt: string,
+): LaunchResult {
+  const platform = process.platform;
+  try {
+    if (platform === "win32") {
+      // `start ""` opens a new console window; the empty title is required
+      // because if the first quoted arg looks title-like, start eats it.
+      // `cmd /k` runs the command and keeps the window open for the user.
+      const inner = `cd /d ${shQuoteWindowsCmd(cwd)} && claude ${shQuoteWindowsCmd(prompt)}`;
+      childSpawn(
+        "cmd",
+        ["/c", "start", '""', "cmd", "/k", inner],
+        { detached: true, stdio: "ignore" },
+      ).unref();
+      return { ok: true, platform, command_summary: `cmd /c start "" cmd /k ${inner}` };
+    }
+    if (platform === "darwin") {
+      const inner = `cd ${shQuoteUnix(cwd)} && claude ${shQuoteUnix(prompt)}`;
+      const apple = `tell application "Terminal" to do script "${appleScriptEscape(inner)}"`;
+      childSpawn("osascript", ["-e", apple], { detached: true, stdio: "ignore" }).unref();
+      return { ok: true, platform, command_summary: `osascript -e '${apple}'` };
+    }
+    if (platform === "linux") {
+      // gnome-terminal is the most common default on desktop Linux. If it's
+      // missing the spawn will fail with ENOENT and we fall back to the
+      // manual-paste path on the caller side.
+      const inner = `claude ${shQuoteUnix(prompt)}; exec bash`;
+      childSpawn(
+        "gnome-terminal",
+        ["--working-directory", cwd, "--", "bash", "-c", inner],
+        { detached: true, stdio: "ignore" },
+      ).unref();
+      return { ok: true, platform, command_summary: `gnome-terminal --working-directory ${cwd} -- bash -c '${inner}'` };
+    }
+    return { ok: false, platform, error: `unsupported platform: ${platform}` };
+  } catch (e: any) {
+    return { ok: false, platform, error: e?.message || String(e) };
+  }
+}
 async function blockAgent(name: string) {
   return api("POST", `/agents/${encodeURIComponent(name)}/block`);
 }
@@ -1344,13 +1423,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "spawn_agent",
       description:
-        "Coordinator-only: create a brand-new ephemeral agent and add them to this chat in one call. The new agent inherits ownership from your owner, so the human behind you can see and manage them in the web UI like any of their own. Returns `auth_token` and a ready-to-paste `onboarding_prompt` — hand those to the human so they can launch a new IDE window for the new agent. The MCP cannot open IDE windows on the host machine itself; the human pastes the prompt into a new Claude Code / Codex terminal to wake the agent up.",
+        "Coordinator-only: create a brand-new ephemeral agent and add them to this chat in one call. The new agent inherits ownership from your owner, so the human behind you can see and manage them in the web UI like any of their own.\n\n" +
+        "Set `auto_launch=true` to actually pop a NEW Claude Code window on the host machine in `work_dir`, with the onboarding prompt already passed as the first message — the new instance authenticates itself via agent_login on startup and shows up online without the human paste'ing anything. Falls back to manual-paste output if the launch fails (e.g. no graphical terminal available).\n\n" +
+        "`target` selects the IDE binary to launch. Only `\"claude\"` is wired up; `\"codex\"` is reserved for future support and currently returns the prompt for manual paste.",
       inputSchema: {
         type: "object",
         properties: {
           chat_id: { type: "string", description: "Chat where you are the coordinator." },
           display_name: { type: "string", description: "User-visible handle for the new agent (must be unique in this chat)." },
           bio: { type: "string", description: "Optional initial bio for the new agent." },
+          auto_launch: {
+            type: "boolean",
+            description: "If true, attempt to spawn a new IDE window in `work_dir` with the onboarding prompt pre-loaded. Default false — returns the prompt for manual paste.",
+            default: false,
+          },
+          target: {
+            type: "string",
+            enum: ["claude", "codex"],
+            description: "IDE binary to launch when auto_launch=true. Only \"claude\" is implemented; \"codex\" falls back to manual paste.",
+            default: "claude",
+          },
+          work_dir: {
+            type: "string",
+            description: "Absolute path of the folder the new IDE window should open in. Required when auto_launch=true.",
+          },
         },
         required: ["chat_id", "display_name"],
       },
@@ -1829,6 +1925,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const chat_id = args?.chat_id;
     const display_name = args?.display_name;
     const bio = args?.bio;
+    const auto_launch = args?.auto_launch === true;
+    const target = (args?.target ?? "claude") as "claude" | "codex";
+    const work_dir = args?.work_dir;
+
     if (typeof chat_id !== "string" || typeof display_name !== "string") {
       return {
         content: [{
@@ -1844,35 +1944,63 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         isError: true,
       };
     }
+    if (target !== "claude" && target !== "codex") {
+      return {
+        content: [{ type: "text", text: "✗ target must be \"claude\" or \"codex\"." }],
+        isError: true,
+      };
+    }
+    if (auto_launch && (typeof work_dir !== "string" || !work_dir.trim())) {
+      return {
+        content: [{
+          type: "text",
+          text: "✗ work_dir (string) is required when auto_launch=true.",
+        }],
+        isError: true,
+      };
+    }
+
     const result: any = await spawnAgentInChat(
       chat_id,
       display_name,
       bio as string | undefined,
     );
-    // Compose a paste-ready onboarding prompt for the new agent. The host
-    // machine is responsible for actually opening a new IDE window — the
-    // MCP can't reach across processes to type into another terminal.
     const token: string | undefined = result?.auth_token;
-    const newAgentDisplayName: string =
-      result?.display_name || display_name;
+    const newAgentDisplayName: string = result?.display_name || display_name;
     const onboarding_prompt = token
       ? `You're being added to an InBetween chat as @${newAgentDisplayName}. ` +
-        `Call \`inbetween.agent_login\` with auth_token="${token}" and you'll be online ` +
+        `Call inbetween.agent_login with auth_token=${token} and you'll be online ` +
         `in the chat. After login, the server pushes your role, members, and any private ` +
         `playbook automatically — read those, then go quiet until @-mentioned.`
       : null;
-    return {
-      content: [
-        {
-          type: "text",
-          text:
-            `✓ Agent spawned:\n${JSON.stringify(result, null, 2)}\n\n` +
-            (onboarding_prompt
-              ? `--- ONBOARDING PROMPT (paste into a fresh IDE) ---\n${onboarding_prompt}`
-              : "(no auth_token returned — backend may be misconfigured)"),
-        },
-      ],
-    };
+
+    // Attempt auto-launch only for target=claude. Codex falls through to the
+    // manual-paste output below; the prompt is still useful, the human just
+    // opens the Codex window themselves.
+    let launched = false;
+    let launchInfo: string | null = null;
+    if (auto_launch && target === "claude" && onboarding_prompt) {
+      const lr = launchClaudeInNewWindow(work_dir as string, onboarding_prompt);
+      if (lr.ok) {
+        launched = true;
+        launchInfo = `✓ New Claude Code window opened in ${work_dir} (platform=${lr.platform}). The agent should come online within a few seconds.`;
+      } else {
+        launchInfo = `⚠ auto_launch failed on ${lr.platform}: ${lr.error}. Falling back to manual paste — give the prompt below to the human.`;
+      }
+    } else if (auto_launch && target === "codex") {
+      launchInfo = "ℹ codex auto-launch is not implemented yet. Give the prompt below to the human; they paste it into a fresh Codex window manually.";
+    }
+
+    const body =
+      `✓ Agent spawned:\n${JSON.stringify(result, null, 2)}\n` +
+      (launchInfo ? `\n${launchInfo}\n` : "") +
+      (onboarding_prompt
+        ? launched
+          ? "" // window already has the prompt; no need to repeat it for human
+          : `\n--- ONBOARDING PROMPT (paste into a fresh IDE) ---\n${onboarding_prompt}`
+        : "\n(no auth_token returned — backend may be misconfigured)");
+
+    return { content: [{ type: "text", text: body }] };
   }
 
   // === Privacy / DND ===
