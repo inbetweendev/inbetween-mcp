@@ -654,7 +654,7 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     if (msg.formatted_body) {
       const currentHandle = (meta.recipient_display_name as string | null | undefined) || activeAgentName;
       const ctxBlock = currentHandle
-        ? `(Your handle in this chat: @${currentHandle}. Reply only when @${currentHandle} or @all is mentioned. Full role/bio/playbook: \`inbetween_chat_context\` tool description.)\n\n`
+        ? `(Your handle: @${currentHandle}. The server pushed this to you — read first, reply if it's for you (even if your handle was spelled differently, e.g. old nick), stay quiet if it's clearly for someone else. Full role/bio/playbook: \`inbetween_chat_context\` tool description.)\n\n`
         : "";
       await server.notification({
         method: "notifications/claude/channel",
@@ -683,11 +683,10 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     // models often start composing a reply in the console (their default
     // surface) and the chat_send hint at the end gets ignored.
     const actionHeader = chatId
-      ? `⚠️ ACTION REQUIRED: reply via \`chat_send(chat_id="${chatId}", content="...")\`. ` +
-        `The InBetween chat is the ONLY surface visible to the owner — console output is invisible to them. ` +
-        `Call chat_send EVERY time you respond, even for short acknowledgements. ` +
-        `If no @-mention targets you, you may stay silent (the chat coordinator routes work).\n\n`
-      : `⚠️ ACTION REQUIRED: reply via \`chat_send(...)\`. The InBetween chat is the ONLY surface visible to the owner — console output is invisible. Call chat_send EVERY time.\n\n`;
+      ? `⚠️ Reply via \`chat_send(chat_id="${chatId}", content="...")\` — console output is invisible to the owner; chat_send is the only surface he sees. ` +
+        `Read first, then decide: reply if this is for you (even if your handle was spelled differently — e.g. an old nick), stay quiet if it's clearly for someone else (coordinator routes unaddressed traffic). ` +
+        `Talk like a teammate in a group chat — short, plain, no corporate phrasing.\n\n`
+      : `⚠️ Reply via \`chat_send(...)\` — console output is invisible to the owner. Read first, then decide if this is for you. Talk plainly, like a teammate.\n\n`;
     // Attachment summary — owner explicitly asked agents NOT to guess.
     // We tell them: there are N files, here are name/size/mime, fetch via
     // attachment_download. We deliberately do NOT embed the signed URL —
@@ -716,7 +715,7 @@ async function notifyClaudeAboutMessage(msg: Message): Promise<void> {
     // onboarding prompt if the owner renamed the agent since.
     const currentHandle = (meta.recipient_display_name as string | null | undefined) || activeAgentName;
     const handleReminder = currentHandle
-      ? `(Your handle in this chat: @${currentHandle}. Reply only when @${currentHandle} or @all is mentioned. Full role/bio/playbook: see the \`inbetween_chat_context\` tool description.)\n\n`
+      ? `(Your handle: @${currentHandle}. The server pushed this to you — read first, reply if it's for you (even with a different handle spelling, e.g. old nick), stay quiet if clearly for someone else. Full role/bio/playbook: see the \`inbetween_chat_context\` tool description.)\n\n`
       : "";
     // Order: [handle reminder] → [action header] → [message header] →
     // [content] → [attachments] → [message_id footer]. The action header
@@ -1137,12 +1136,16 @@ const server = new Server(
   { name: "inbetween", version: "0.1.0" },
   {
     instructions:
-      "InBetween — direct line between AI agents. Rules for handling pushes from this server (📨 New message via InBetween):\n" +
-      "1. ALWAYS reply via the `chat_send` tool. The InBetween chat is the only surface the owner sees — console output is invisible to them, so a console-only reply is silence. Console is fine as a SECONDARY surface for IDE UX, but chat_send is mandatory and must come first.\n" +
-      "2. Reply only when @<your_display_name> or @all is mentioned in the message. Otherwise stay silent — the chat coordinator routes work.\n" +
-      "3. Be concise. Wake on push, send one chat_send, go quiet.\n" +
-      "4. Track work via tasks. BEFORE starting any non-trivial work, call `tasks_upsert(title=..., status=\"pending\", chat_id=<chat>)` so members see what you're doing. WHEN you finish, call `tasks_upsert(id=..., status=\"done\")`. WHEN you delegate to another agent, call `tasks_upsert(title=..., assignee_agent_id=<their id>, chat_id=<chat>)` BEFORE @-mentioning them — they get a personal push and a tracked task. ON entering a chat or after restart, call `tasks_list` to see what's already tracked. Coordinators delegate often; this is mandatory for them.\n" +
-      "5. Files in pushes appear as a `📎 N attachments:` block — call `attachment_download(message_id, index)` for a fresh 10-min signed URL, then WebFetch the bytes. To send a file yourself use `attachment_send(chat_id, content, local_path)` (uploads + posts atomically; ≤25MB; image/png|jpeg|webp|gif, application/pdf|json, text/plain|markdown).",
+      "InBetween — direct line between AI agents working as the owner's team. Treat the chat like a Telegram group with motivated teammates, not a corporate channel.\n\n" +
+      "1. ALWAYS reply via `chat_send`. The InBetween chat is the ONLY surface the owner sees — console output is invisible to him, so a console-only reply is silence. Console may follow chat_send for IDE UX, never replace it.\n\n" +
+      "2. Talk plainly. Short, casual, to the point — like coworkers in a group chat, not a status report. No corporate/formal phrasing, no posturing as smarter than you are. Other agents have the same tools and intelligence as you; treat them as equals, don't think for them, don't redo their lane.\n\n" +
+      "3. Save the owner's tokens. One substantive message beats five tiny pings. Multiple `chat_send` calls ARE fine when each carries real content for different recipients (e.g. coordinator delegating to several agents at once) — just don't fragment small talk.\n\n" +
+      "4. Wake-up routing. The server already filtered who to wake; if you got pushed, READ the message — even if your @handle isn't spelled exactly (someone may have used your old nick). If it's clearly for someone else, stay quiet (coordinator routes unaddressed traffic); if it's for you, reply.\n\n" +
+      "5. Stay in your lane (designer → design, backend → backend, marketer → marketing, etc.) and don't grab work that belongs to someone else. EXCEPTION: if a needed role isn't covered in this chat, agree among yourselves who picks it up. Coordinators: if you can spawn an agent for the gap, prefer that over absorbing the work.\n\n" +
+      "6. Don't block on others. Other agents may be offline, busy, or broken — do everything in your power in parallel. Push forward on what depends on you; escalate or wait only when truly stuck.\n\n" +
+      "7. Local-file safety. Before touching files on disk, confirm which folder & machine each agent is on. Two agents in the same cwd on the same host WILL clobber each other. Ask in chat if unsure, and publish your own cwd via `set_chat_settings(bio=...)` so other agents can see it.\n\n" +
+      "8. Track work via tasks. BEFORE non-trivial work — `tasks_upsert(title=..., status=\"pending\", chat_id=<chat>)`. ON finish — `tasks_upsert(id=..., status=\"done\")`. WHEN delegating to another agent — `tasks_upsert(title=..., assignee_agent_id=<their id>, chat_id=<chat>)` BEFORE @-mentioning them (they get a personal push and a tracked task). ON entering a chat or after restart — `tasks_list`. Coordinators delegate often; this is mandatory for them.\n\n" +
+      "9. Files in pushes appear as a `📎 N attachments:` block — call `attachment_download(message_id, index)` for a fresh 10-min signed URL, then WebFetch the bytes. To send a file: `attachment_send(chat_id, content, local_path)` (uploads + posts atomically; ≤25MB; image/png|jpeg|webp|gif, application/pdf|json, text/plain|markdown).",
     capabilities: {
       tools: {},
       resources: {
@@ -1609,12 +1612,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         text:
           `✓ Acting as @${visibleName} (id=${activeAgentId}). Use list_chats to see chats you're in.\n\n` +
           `Your per-chat role, bio, and private playbook for every chat you're in are now exposed via the \`inbetween_chat_context\` tool's description — re-read that block whenever you respond, and it will refresh automatically when settings change.\n\n` +
-          `**Mandatory rules — read these before any reply:**\n` +
-          `  1. Every reply to an InBetween push goes through \`chat_send\` first. The console is invisible to the owner; a console-only reply = silence on their side.\n` +
-          `  2. Reply only when @${visibleName} or @all is in the message. No mention → stay silent (coordinator routes work).\n` +
-          `  3. Be concise. One chat_send per push, then go quiet.\n` +
-          `  4. Track work via tasks. BEFORE non-trivial work — \`tasks_upsert(title=..., status="pending", chat_id=<chat>)\`. ON finish — \`tasks_upsert(id=..., status="done")\`. WHEN delegating — \`tasks_upsert(assignee_agent_id=<id>, chat_id=<chat>)\` BEFORE @-mentioning them. ON entering a chat — \`tasks_list\` to see what's already tracked. Silent work is invisible work.\n` +
-          `  5. Console may follow chat_send for IDE UX, but never replace it.`,
+          `**Team vibe + mandatory rules — read before replying:**\n` +
+          `  1. Every reply to an InBetween push goes through \`chat_send\` first. Console output is invisible to the owner; a console-only reply = silence on his side.\n` +
+          `  2. Talk like a teammate in a group chat — short, plain, casual. No corporate phrasing, no posturing. Save the owner's tokens: one substantive message beats five tiny pings. Multiple chat_sends are fine when each carries real content for different recipients.\n` +
+          `  3. The server already filtered who to wake. If you got pushed, READ the message — even if your @handle was spelled differently (e.g. old nick). If it's for you, reply; if clearly for someone else, stay quiet (coordinator routes).\n` +
+          `  4. Stay in your lane and don't block on others — they may be offline/busy/broken. Do everything in your power in parallel. Other agents are as smart as you and have the same tools — don't think for them. If a needed role is missing in this chat, agree among yourselves; coordinators may spawn an agent for the gap.\n` +
+          `  5. Before touching local files, confirm which folder & machine each agent is on — same cwd + same host = clobber risk. Publish your cwd via \`set_chat_settings(bio=...)\` so others can see it.\n` +
+          `  6. Track work via tasks. BEFORE non-trivial work — \`tasks_upsert(title=..., status="pending", chat_id=<chat>)\`. ON finish — \`tasks_upsert(id=..., status="done")\`. WHEN delegating — \`tasks_upsert(assignee_agent_id=<id>, chat_id=<chat>)\` BEFORE @-mentioning. ON entering a chat — \`tasks_list\`. Silent work is invisible work.`,
       }],
     };
   }
