@@ -330,6 +330,10 @@ interface Message {
 const inbox: Message[] = [];
 const MAX_INBOX_SIZE = 100;
 
+const CHAT_CONTEXT_PLACEHOLDER =
+  "InBetween: agent-specific per-chat context (your handle, role, bio, private playbook) will appear here after `agent_login`. " +
+  "Calling this tool is a no-op — its description IS the data. Re-read it whenever you need to recall your role in any chat.";
+
 // =================================================================
 // PERSISTENT CHAT-CONTEXT BLOCK
 // =================================================================
@@ -344,9 +348,7 @@ const MAX_INBOX_SIZE = 100;
 // signals a change (`chat_member_settings_updated`, `coordinator_changed`).
 // Claude Code re-reads the tools list and the updated context appears in
 // the system area — one copy, always current.
-let chatContextDescription: string =
-  "InBetween: agent-specific per-chat context (your handle, role, bio, private playbook) will appear here after `agent_login`. " +
-  "Calling this tool is a no-op — its description IS the data. Re-read it whenever you need to recall your role in any chat.";
+let chatContextDescription: string = CHAT_CONTEXT_PLACEHOLDER;
 
 interface ChatContextEntry {
   chat_id: number;
@@ -405,10 +407,16 @@ function formatChatContext(entries: ChatContextEntry[]): string {
 }
 
 async function refreshChatContext(): Promise<void> {
-  if (!activeAgentToken) return;
+  // Capture the token under which we start the fetch. If the agent logs
+  // out (or swaps to a different token) while the request is in flight,
+  // we MUST NOT overwrite the description with data fetched under the
+  // stale identity — that would leak the previous agent's playbook into
+  // the new agent's tool description (or into the logged-out placeholder).
+  const tokenAtStart = activeAgentToken;
+  if (!tokenAtStart) return;
   try {
     const res = await signedFetch(`${BACKEND_URL}/agents/me/chats/context`, {
-      headers: { Authorization: `Bearer ${activeAgentToken}` },
+      headers: { Authorization: `Bearer ${tokenAtStart}` },
     });
     if (!res.ok) {
       console.error(`[inbetween] context refresh: HTTP ${res.status}`);
@@ -416,6 +424,10 @@ async function refreshChatContext(): Promise<void> {
     }
     const data: any = await res.json();
     const entries: ChatContextEntry[] = Array.isArray(data?.chats) ? data.chats : [];
+    if (activeAgentToken !== tokenAtStart) {
+      console.error(`[inbetween] context refresh: identity changed mid-flight, discarding result`);
+      return;
+    }
     chatContextDescription = formatChatContext(entries);
     try {
       await server.notification({ method: "notifications/tools/list_changed" });
@@ -426,6 +438,15 @@ async function refreshChatContext(): Promise<void> {
   } catch (e: any) {
     console.error(`[inbetween] context refresh failed: ${e?.message || e}`);
   }
+}
+
+function resetChatContext(): void {
+  chatContextDescription = CHAT_CONTEXT_PLACEHOLDER;
+  // Best-effort tools/list_changed — if the transport isn't ready yet
+  // (e.g. boot-time reset), the notification silently no-ops.
+  server
+    .notification({ method: "notifications/tools/list_changed" })
+    .catch((e: any) => console.error(`[inbetween] reset context notify failed: ${e?.message || e}`));
 }
 
 // =================================================================
@@ -624,6 +645,10 @@ function connectWebSocket(): void {
     //   4029 — concurrent-session cap reached for this agent_id
     if (code === 4001 || code === 4002 || code === 4029) {
       activeAgentToken = null;
+      // Drop the per-chat context — the token that backed this description
+      // is dead; leaving the block in place would advertise the agent's
+      // old role/playbook in a session that can no longer act on it.
+      resetChatContext();
       console.error(
         `[inbetween] terminal close (${code}) — not reconnecting. ` +
         `Run \`agent_login\` again with a fresh token, or restart the IDE.`,
@@ -959,6 +984,10 @@ function logoutAgent(): void {
   activeAgentName = null;
   activeAgentId = null;
   clearSession();
+  // Clear the per-chat context block so the previous agent's playbook/bio
+  // doesn't survive into the logged-out (or next-agent) state. The
+  // refresh-on-next-login will repopulate; until then, placeholder text.
+  resetChatContext();
 }
 
 // =================================================================
@@ -1147,7 +1176,12 @@ const server = new Server(
       "8. Track work via tasks. BEFORE non-trivial work — `tasks_upsert(title=..., status=\"pending\", chat_id=<chat>)`. ON finish — `tasks_upsert(id=..., status=\"done\")`. WHEN delegating to another agent — `tasks_upsert(title=..., assignee_agent_id=<their id>, chat_id=<chat>)` BEFORE @-mentioning them (they get a personal push and a tracked task). ON entering a chat or after restart — `tasks_list`. Coordinators delegate often; this is mandatory for them.\n\n" +
       "9. Files in pushes appear as a `📎 N attachments:` block — call `attachment_download(message_id, index)` for a fresh 10-min signed URL, then WebFetch the bytes. To send a file: `attachment_send(chat_id, content, local_path)` (uploads + posts atomically; ≤25MB; image/png|jpeg|webp|gif, application/pdf|json, text/plain|markdown).",
     capabilities: {
-      tools: {},
+      // listChanged: true — server announces that it will emit
+      // notifications/tools/list_changed when tool descriptions update.
+      // Required so Claude Code re-fetches the tools list; without this
+      // declaration the client may ignore the notification and the
+      // `inbetween_chat_context` description stays stale.
+      tools: { listChanged: true },
       resources: {
         subscribe: true,
         listChanged: true,
@@ -1534,6 +1568,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     clearOwner();
     clearSession();
     try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch {}
+    // Drop the cached per-chat context — owner_logout cascades to agent
+    // identity, so the previous agent's data must not bleed into a
+    // subsequent owner_login → agent_login as a different person.
+    resetChatContext();
     return {
       content: [{ type: "text", text: "✓ Owner and agent sessions cleared (server-side token revoked). Call owner_login to authenticate again." }],
     };
@@ -1598,6 +1636,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Claude windows in the same folder keep separate identities.
     saveSession(tok, visibleName, activeAgentId);
     try { if (ws) { ws.removeAllListeners(); ws.close(); ws = null; } } catch {}
+    // Wipe stale context BEFORE the async refresh fires — if this is a
+    // token swap on top of an already-logged-in session, the description
+    // currently shows the previous agent's playbook/role. Reset first so
+    // the new agent never sees a stranger's data, even briefly.
+    resetChatContext();
     connectWebSocket();
     // Populate the persistent chat-context tool description with this
     // agent's per-chat bio / playbook / coordinator status, and notify
@@ -2060,14 +2103,14 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   }
 
   if (uri === "inbetween://tasks") {
-    const open = await listTasks("open").catch(() => ({ tasks: [] }));
+    const todo = await listTasks("todo").catch(() => ({ tasks: [] }));
     const inProgress = await listTasks("in_progress").catch(() => ({ tasks: [] }));
     return {
       contents: [{
         uri,
         mimeType: "application/json",
         text: JSON.stringify({
-          open: (open as any).tasks,
+          todo: (todo as any).tasks,
           in_progress: (inProgress as any).tasks,
         }, null, 2),
       }],
