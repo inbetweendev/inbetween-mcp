@@ -1095,6 +1095,22 @@ async function spawnAgentInChat(
 // only need per-platform string quoting (not shell-meta escaping).
 // =================================================================
 
+// LLMs love to JSON-stringify numeric ids ("42") even when the schema asks
+// for a number — coerce both shapes here so the handler doesn't reject the
+// call with a confusing "agent_id must be number" when the user clearly
+// meant "agent 42".
+function coerceAgentId(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v) && Number.isInteger(v)) return v;
+  if (typeof v === "string") {
+    const t = v.trim();
+    if (/^\d+$/.test(t)) {
+      const n = parseInt(t, 10);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
 function shQuoteUnix(s: string): string {
   // Wrap in single quotes; embed internal single quotes via `'\''` dance.
   return "'" + s.replace(/'/g, "'\\''") + "'";
@@ -1125,16 +1141,40 @@ function launchClaudeInNewWindow(
   const platform = process.platform;
   try {
     if (platform === "win32") {
-      // `start ""` opens a new console window; the empty title is required
-      // because if the first quoted arg looks title-like, start eats it.
-      // `cmd /k` runs the command and keeps the window open for the user.
-      const inner = `cd /d ${shQuoteWindowsCmd(cwd)} && claude ${shQuoteWindowsCmd(prompt)}`;
+      // Windows console spawn — three landmines stacked on top of each other:
+      //
+      //   1. Node's default Windows arg escaping uses CRT rules (backslash-
+      //      quote pairs). cmd.exe parses quotes differently and treats the
+      //      backslash as literal, so a path that goes through default
+      //      spawn ends up looking like `cd /d \"C:\…\"` to cmd — which
+      //      throws "Синтаксическая ошибка в имени файла". Fix:
+      //      windowsVerbatimArguments=true → Node passes our args verbatim,
+      //      cmd sees exactly what we wrote.
+      //
+      //   2. Doing `cd /d <path> && claude …` inside a cmd /k means cmd has
+      //      to parse a nested quoted path before claude runs. Skip that
+      //      whole layer: `start /D <path>` natively sets the new process's
+      //      working directory, so the inner cmd /k just runs `claude …`.
+      //
+      //   3. `start ""` (empty title) is still required so start doesn't
+      //      mistake the next quoted token for a window title.
+      //
+      // The prompt itself is plain ASCII with single quotes / spaces / dashes
+      // (no `"` after we dropped the auth_token="…" form, no &/|/<>/() either),
+      // so wrapping it in plain double quotes is safe — cmd's two-quote
+      // rule preserves them unmodified.
+      const quotedCwd = `"${cwd.replace(/"/g, '""')}"`;
+      const quotedPrompt = `"${prompt.replace(/"/g, '""')}"`;
       childSpawn(
         "cmd",
-        ["/c", "start", '""', "cmd", "/k", inner],
-        { detached: true, stdio: "ignore" },
+        ["/c", "start", '""', "/D", quotedCwd, "cmd", "/k", `claude ${quotedPrompt}`],
+        { detached: true, stdio: "ignore", windowsVerbatimArguments: true },
       ).unref();
-      return { ok: true, platform, command_summary: `cmd /c start "" cmd /k ${inner}` };
+      return {
+        ok: true,
+        platform,
+        command_summary: `cmd /c start "" /D ${quotedCwd} cmd /k claude ${quotedPrompt}`,
+      };
     }
     if (platform === "darwin") {
       const inner = `cd ${shQuoteUnix(cwd)} && claude ${shQuoteUnix(prompt)}`;
@@ -1371,7 +1411,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: "object",
         properties: {
           chat_id: { type: "string", description: "Chat where you are the coordinator." },
-          agent_id: { type: "number", description: "Existing agent's id to add." },
+          agent_id: {
+            type: ["number", "string"],
+            description: "Existing agent's id (integer; string-integer also accepted). Discover via `list_agents` if you don't know it.",
+          },
         },
         required: ["chat_id", "agent_id"],
       },
@@ -1384,7 +1427,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: "object",
         properties: {
           chat_id: { type: "string", description: "Chat id." },
-          agent_id: { type: "number", description: "Agent to remove. Pass your own agent id to leave the chat." },
+          agent_id: {
+            type: ["number", "string"],
+            description: "Agent to remove (integer; string-integer also accepted). Pass your own id to leave. Discover via `list_agents`.",
+          },
         },
         required: ["chat_id", "agent_id"],
       },
@@ -1595,8 +1641,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: "Private — only the target sees this. Empty string clears it.",
           },
           agent_id: {
-            type: "number",
-            description: "Optional target agent. Omit to edit your own row. When provided, requires you to be the coordinator of `chat_id`; non-coordinators silently end up editing themselves instead.",
+            type: ["number", "string"],
+            description: "Optional target agent (integer; string-integer also accepted). Omit to edit your own row. When provided, requires you to be the coordinator of `chat_id`; non-coordinators silently end up editing themselves instead. Discover via `list_agents`.",
           },
         },
         required: ["chat_id"],
@@ -1827,10 +1873,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "add_chat_member") {
     const chat_id = args?.chat_id;
-    const agent_id = args?.agent_id;
-    if (typeof chat_id !== "string" || typeof agent_id !== "number") {
+    const agent_id = coerceAgentId(args?.agent_id);
+    if (typeof chat_id !== "string" || agent_id === null) {
       return {
-        content: [{ type: "text", text: "✗ Required: chat_id (string), agent_id (number)." }],
+        content: [{ type: "text", text: "✗ Required: chat_id (string), agent_id (integer or string-integer)." }],
         isError: true,
       };
     }
@@ -1844,10 +1890,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "remove_chat_member") {
     const chat_id = args?.chat_id;
-    const agent_id = args?.agent_id;
-    if (typeof chat_id !== "string" || typeof agent_id !== "number") {
+    const agent_id = coerceAgentId(args?.agent_id);
+    if (typeof chat_id !== "string" || agent_id === null) {
       return {
-        content: [{ type: "text", text: "✗ Required: chat_id (string), agent_id (number)." }],
+        content: [{ type: "text", text: "✗ Required: chat_id (string), agent_id (integer or string-integer)." }],
         isError: true,
       };
     }
@@ -2190,7 +2236,20 @@ ${JSON.stringify(r, null, 2)}` }] };
     return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
   }
   if (name === "set_chat_settings") {
-    const targetAgentId = args?.agent_id as number | undefined;
+    // agent_id is optional — coerce both number and string-integer; reject
+    // a present-but-unparseable value with a clear message so the LLM can
+    // self-correct instead of silently editing itself.
+    let targetAgentId: number | undefined;
+    if (args?.agent_id !== undefined && args?.agent_id !== null) {
+      const coerced = coerceAgentId(args.agent_id);
+      if (coerced === null) {
+        return {
+          content: [{ type: "text", text: "✗ agent_id must be an integer or string-integer." }],
+          isError: true,
+        };
+      }
+      targetAgentId = coerced;
+    }
     await setChatSettings({
       chat_id: args!.chat_id as string,
       notify_mode: args?.notify_mode as any,
