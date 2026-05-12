@@ -16,6 +16,7 @@ import WebSocket from "ws";
 import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, appendFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+import { spawn as childSpawn } from "child_process";
 
 // =================================================================
 // FILE LOGGING — mirror everything we'd write to stderr into
@@ -1052,12 +1053,151 @@ async function getMessagesWith(with_agent: string, limit: number) {
     `/messages?with_agent=${encodeURIComponent(with_agent)}&limit=${limit}`,
   );
 }
-async function updateProfile(payload: {
-  description?: string;
-  specialization?: string[];
-  status?: string;
-}) {
-  return api("PATCH", "/agents/me", payload);
+// bio (self + coord-edits-other) lives in chat_members.bio and is set via
+// set_chat_settings — there's no separate update_profile / set_member_bio
+// surface anymore. The old global agents.description column is no longer
+// written from MCP.
+async function addChatMember(chat_id: string, agent_id: number) {
+  return api(
+    "POST",
+    `/chats/${encodeURIComponent(chat_id)}/members`,
+    { agent_id },
+  );
+}
+async function removeChatMember(chat_id: string, agent_id: number) {
+  return api(
+    "DELETE",
+    `/chats/${encodeURIComponent(chat_id)}/members/${agent_id}`,
+  );
+}
+async function spawnAgentInChat(
+  chat_id: string,
+  display_name: string,
+  bio?: string,
+) {
+  const body: any = { display_name };
+  // Field name follows the backend CreateEphemeralAgentReq: `bio` lands in
+  // chat_members.bio for the new member, not in the global agents.description.
+  if (bio !== undefined) body.bio = bio;
+  return api("POST", `/chats/${encodeURIComponent(chat_id)}/agents`, body);
+}
+
+// =================================================================
+// LAUNCH NEW IDE WINDOW
+// Used by `spawn_agent` with auto_launch=true to actually pop a fresh
+// Claude Code window in a target folder, with the onboarding prompt
+// already passed as the first positional arg. Claude Code accepts the
+// initial prompt that way (`claude "<prompt>"`) — it stays interactive
+// and the prompt becomes the first user message, which is exactly what
+// makes the new agent autonomously call agent_login on startup.
+//
+// We never use `shell: true`; argv arrays go to spawn directly, so we
+// only need per-platform string quoting (not shell-meta escaping).
+// =================================================================
+
+// LLMs love to JSON-stringify numeric ids ("42") even when the schema asks
+// for a number — coerce both shapes here so the handler doesn't reject the
+// call with a confusing "agent_id must be number" when the user clearly
+// meant "agent 42".
+function coerceAgentId(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v) && Number.isInteger(v)) return v;
+  if (typeof v === "string") {
+    const t = v.trim();
+    if (/^\d+$/.test(t)) {
+      const n = parseInt(t, 10);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
+function shQuoteUnix(s: string): string {
+  // Wrap in single quotes; embed internal single quotes via `'\''` dance.
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+function shQuoteWindowsCmd(s: string): string {
+  // cmd.exe: wrap in double quotes, escape internal `"` by doubling.
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+function appleScriptEscape(s: string): string {
+  // Embedding inside an AppleScript double-quoted string literal —
+  // escape backslashes first, then quotes.
+  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+interface LaunchResult {
+  ok: boolean;
+  platform: NodeJS.Platform;
+  command_summary?: string;
+  error?: string;
+}
+
+function launchClaudeInNewWindow(
+  cwd: string,
+  prompt: string,
+): LaunchResult {
+  const platform = process.platform;
+  try {
+    if (platform === "win32") {
+      // Windows console spawn — three landmines stacked on top of each other:
+      //
+      //   1. Node's default Windows arg escaping uses CRT rules (backslash-
+      //      quote pairs). cmd.exe parses quotes differently and treats the
+      //      backslash as literal, so a path that goes through default
+      //      spawn ends up looking like `cd /d \"C:\…\"` to cmd — which
+      //      throws "Синтаксическая ошибка в имени файла". Fix:
+      //      windowsVerbatimArguments=true → Node passes our args verbatim,
+      //      cmd sees exactly what we wrote.
+      //
+      //   2. Doing `cd /d <path> && claude …` inside a cmd /k means cmd has
+      //      to parse a nested quoted path before claude runs. Skip that
+      //      whole layer: `start /D <path>` natively sets the new process's
+      //      working directory, so the inner cmd /k just runs `claude …`.
+      //
+      //   3. `start ""` (empty title) is still required so start doesn't
+      //      mistake the next quoted token for a window title.
+      //
+      // The prompt itself is plain ASCII with single quotes / spaces / dashes
+      // (no `"` after we dropped the auth_token="…" form, no &/|/<>/() either),
+      // so wrapping it in plain double quotes is safe — cmd's two-quote
+      // rule preserves them unmodified.
+      const quotedCwd = `"${cwd.replace(/"/g, '""')}"`;
+      const quotedPrompt = `"${prompt.replace(/"/g, '""')}"`;
+      childSpawn(
+        "cmd",
+        ["/c", "start", '""', "/D", quotedCwd, "cmd", "/k", `claude ${quotedPrompt}`],
+        { detached: true, stdio: "ignore", windowsVerbatimArguments: true },
+      ).unref();
+      return {
+        ok: true,
+        platform,
+        command_summary: `cmd /c start "" /D ${quotedCwd} cmd /k claude ${quotedPrompt}`,
+      };
+    }
+    if (platform === "darwin") {
+      const inner = `cd ${shQuoteUnix(cwd)} && claude ${shQuoteUnix(prompt)}`;
+      const apple = `tell application "Terminal" to do script "${appleScriptEscape(inner)}"`;
+      childSpawn("osascript", ["-e", apple], { detached: true, stdio: "ignore" }).unref();
+      return { ok: true, platform, command_summary: `osascript -e '${apple}'` };
+    }
+    if (platform === "linux") {
+      // gnome-terminal is the most common default on desktop Linux. If it's
+      // missing the spawn will fail with ENOENT and we fall back to the
+      // manual-paste path on the caller side.
+      const inner = `claude ${shQuoteUnix(prompt)}; exec bash`;
+      childSpawn(
+        "gnome-terminal",
+        ["--working-directory", cwd, "--", "bash", "-c", inner],
+        { detached: true, stdio: "ignore" },
+      ).unref();
+      return { ok: true, platform, command_summary: `gnome-terminal --working-directory ${cwd} -- bash -c '${inner}'` };
+    }
+    return { ok: false, platform, error: `unsupported platform: ${platform}` };
+  } catch (e: any) {
+    return { ok: false, platform, error: e?.message || String(e) };
+  }
 }
 async function blockAgent(name: string) {
   return api("POST", `/agents/${encodeURIComponent(name)}/block`);
@@ -1124,7 +1264,6 @@ async function chatMessages(opts: {
   since?: string;
   until?: string;
   unread?: boolean;
-  q?: string;
 }) {
   const qs = new URLSearchParams();
   if (opts.limit != null) qs.set("limit", String(opts.limit));
@@ -1132,7 +1271,6 @@ async function chatMessages(opts: {
   if (opts.since) qs.set("since", opts.since);
   if (opts.until) qs.set("until", opts.until);
   if (opts.unread) qs.set("unread", "true");
-  if (opts.q) qs.set("q", opts.q);
   const path = `/chats/${encodeURIComponent(opts.chat_id)}/messages?${qs.toString()}`;
   return api("GET", path);
 }
@@ -1144,12 +1282,17 @@ async function chatSend(
   content: string,
   attachments: any[] = [],
   metadata: any = {},
+  reply_to_message_id?: string,
 ) {
-  return api("POST", `/chats/${encodeURIComponent(chat_id)}/messages`, {
-    content,
-    attachments,
-    metadata,
-  });
+  const body: any = { content, attachments, metadata };
+  if (reply_to_message_id) body.reply_to_message_id = reply_to_message_id;
+  return api("POST", `/chats/${encodeURIComponent(chat_id)}/messages`, body);
+}
+async function chatThread(chat_id: string, root_message_id: string) {
+  return api(
+    "GET",
+    `/chats/${encodeURIComponent(chat_id)}/thread/${encodeURIComponent(root_message_id)}`,
+  );
 }
 async function searchMessages(opts: {
   q: string; limit?: number; since?: string; until?: string; chat_id?: string;
@@ -1169,11 +1312,13 @@ async function setChatSettings(opts: {
   notify_mode?: "always" | "on_mention" | "never";
   bio?: string;
   instructions?: string;
+  agent_id?: number;
 }) {
   const body: any = {};
   if (opts.notify_mode !== undefined) body.notify_mode = opts.notify_mode;
   if (opts.bio !== undefined) body.bio = opts.bio;
   if (opts.instructions !== undefined) body.instructions = opts.instructions;
+  if (opts.agent_id !== undefined) body.agent_id = opts.agent_id;
   return api("PATCH", `/chats/${encodeURIComponent(opts.chat_id)}/membership`, body);
 }
 async function inboxUnread(opts: { limit?: number; since?: string } = {}) {
@@ -1283,20 +1428,66 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: "object", properties: {} },
     },
     {
-      name: "update_profile",
+      name: "add_chat_member",
       description:
-        "Update your agent profile (description, specialization, status).",
+        "Coordinator-only: pull an EXISTING agent into this chat. The agent must already exist (e.g. one of your owner's other agents discoverable via list_agents at the owner level). For brand-new agents use `spawn_agent` instead. Backend rejects this call if you are not the coordinator of `chat_id`.",
       inputSchema: {
         type: "object",
         properties: {
-          description: { type: "string" },
-          specialization: { type: "array", items: { type: "string" } },
-          status: {
-            type: "string",
-            description:
-              "Free-form status: 'available', 'busy', 'out for coffee', etc.",
+          chat_id: { type: "string", description: "Chat where you are the coordinator." },
+          agent_id: {
+            type: ["number", "string"],
+            description: "Existing agent's id (integer; string-integer also accepted). Discover via `list_agents` if you don't know it.",
           },
         },
+        required: ["chat_id", "agent_id"],
+      },
+    },
+    {
+      name: "remove_chat_member",
+      description:
+        "Remove an agent from this chat. Either you (any agent removing yourself) or coordinator-only when removing somebody else. If the target is ephemeral and this was their last chat they're soft-deleted server-side. Use this to kick an unresponsive teammate after a delegation timed out, then `spawn_agent` a replacement.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "Chat id." },
+          agent_id: {
+            type: ["number", "string"],
+            description: "Agent to remove (integer; string-integer also accepted). Pass your own id to leave. Discover via `list_agents`.",
+          },
+        },
+        required: ["chat_id", "agent_id"],
+      },
+    },
+    {
+      name: "spawn_agent",
+      description:
+        "Coordinator-only: create a brand-new ephemeral agent and add them to this chat in one call. The new agent inherits ownership from your owner, so the human behind you can see and manage them in the web UI like any of their own.\n\n" +
+        "Set `auto_launch=true` to actually pop a NEW Claude Code window on the host machine in `work_dir`, with the onboarding prompt already passed as the first message — the new instance authenticates itself via agent_login on startup and shows up online without the human paste'ing anything. Falls back to manual-paste output if the launch fails (e.g. no graphical terminal available).\n\n" +
+        "`target` selects the IDE binary to launch. Only `\"claude\"` is wired up; `\"codex\"` is reserved for future support and currently returns the prompt for manual paste.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "Chat where you are the coordinator." },
+          display_name: { type: "string", description: "User-visible handle for the new agent (must be unique in this chat)." },
+          bio: { type: "string", description: "Optional initial bio for the new agent." },
+          auto_launch: {
+            type: "boolean",
+            description: "If true, attempt to spawn a new IDE window in `work_dir` with the onboarding prompt pre-loaded. Default false — returns the prompt for manual paste.",
+            default: false,
+          },
+          target: {
+            type: "string",
+            enum: ["claude", "codex"],
+            description: "IDE binary to launch when auto_launch=true. Only \"claude\" is implemented; \"codex\" falls back to manual paste.",
+            default: "claude",
+          },
+          work_dir: {
+            type: "string",
+            description: "Absolute path of the folder the new IDE window should open in. Required when auto_launch=true.",
+          },
+        },
+        required: ["chat_id", "display_name"],
       },
     },
     // ===== #6, #11 — tasks =====
@@ -1408,7 +1599,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "chat_messages",
       description:
-        "Get messages from a specific chat with optional filters: limit, before (cursor), since/until (ISO timestamps), unread (only my unread), q (full-text search).",
+        "Get messages from a specific chat with optional filters: limit, before (cursor), since/until (ISO timestamps), unread (only my unread). For full-text search use `search_messages` — it accepts an optional chat_id filter and does the same thing more directly.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1418,7 +1609,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           since: { type: "string", description: "ISO 8601 — only messages at or after" },
           until: { type: "string", description: "ISO 8601 — only messages strictly before" },
           unread: { type: "boolean", description: "Only my unread messages", default: false },
-          q: { type: "string", description: "Full-text search query (websearch syntax: phrases, OR, minus)" },
         },
         required: ["chat_id"],
       },
@@ -1439,8 +1629,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           chat_id: { type: "string", description: "Chat id (from list_chats)" },
           content: { type: "string", description: "Message text. Include @<display_name> or @all to control routing." },
           attachments: { type: "array", items: { type: "object" }, description: "Pre-uploaded attachment objects (rare — usually you should call `attachment_send` instead which handles upload + send atomically)." },
+          reply_to_message_id: {
+            type: "string",
+            description: "Optional UUID of a parent message to reply to. The new message links to that parent and inherits its thread root, so `chat_thread` can return them together.",
+          },
         },
         required: ["chat_id", "content"],
+      },
+    },
+    {
+      name: "chat_thread",
+      description:
+        "Fetch every message in a single reply thread, in chronological order. Pass `root_message_id` — the UUID of the FIRST message in the thread (either the literal root, or any reply's `root_message_id` field). Returns the root plus every reply, flat. Useful when you receive a push that references an earlier message and you need the conversation context.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "Chat id." },
+          root_message_id: { type: "string", description: "UUID of the thread's root message." },
+        },
+        required: ["chat_id", "root_message_id"],
       },
     },
     // ===== Attachments =====
@@ -1523,10 +1730,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "set_chat_settings",
       description:
-        "Configure my per-chat settings. Three independent fields:\n" +
-        "• notify_mode: 'always' | 'on_mention' | 'never' — when this chat pushes me.\n" +
-        "• bio: short PUBLIC card visible to other members; describes what I do in this chat.\n" +
-        "• instructions: PRIVATE notes only I see; rules/playbook for myself, prepended every time I read this chat.",
+        "Configure per-chat settings. Three independent fields:\n" +
+        "• notify_mode: 'always' | 'on_mention' | 'never' — when this chat pushes the target.\n" +
+        "• bio: short PUBLIC card visible to other members; describes what the target does in this chat.\n" +
+        "• instructions: PRIVATE playbook only the target sees; prepended every time they read this chat.\n\n" +
+        "By default edits YOUR OWN row in this chat. Pass `agent_id` to edit somebody else's row — backend allows this only if you are the coordinator of `chat_id` (otherwise the call silently falls back to editing yourself, so coord checks must happen client-side if precision matters).",
       inputSchema: {
         type: "object",
         properties: {
@@ -1538,7 +1746,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           instructions: {
             type: "string",
-            description: "Private — only I see this. Empty string clears it.",
+            description: "Private — only the target sees this. Empty string clears it.",
+          },
+          agent_id: {
+            type: ["number", "string"],
+            description: "Optional target agent (integer; string-integer also accepted). Omit to edit your own row. When provided, requires you to be the coordinator of `chat_id`; non-coordinators silently end up editing themselves instead. Discover via `list_agents`.",
           },
         },
         required: ["chat_id"],
@@ -1767,21 +1979,120 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return { content: [{ type: "text", text: "✓ Agent identity cleared. Owner session is still active — paste another agent prompt or call agent_login(token)." }] };
   }
 
-  if (name === "update_profile") {
-    const payload: any = {};
-    if (args?.description !== undefined) payload.description = args.description;
-    if (args?.specialization !== undefined)
-      payload.specialization = args.specialization;
-    if (args?.status !== undefined) payload.status = args.status;
-    const result = await updateProfile(payload);
+  if (name === "add_chat_member") {
+    const chat_id = args?.chat_id;
+    const agent_id = coerceAgentId(args?.agent_id);
+    if (typeof chat_id !== "string" || agent_id === null) {
+      return {
+        content: [{ type: "text", text: "✗ Required: chat_id (string), agent_id (integer or string-integer)." }],
+        isError: true,
+      };
+    }
+    const result = await addChatMember(chat_id, agent_id);
     return {
       content: [
-        {
-          type: "text",
-          text: `✓ Profile updated:\n${JSON.stringify(result, null, 2)}`,
-        },
+        { type: "text", text: `✓ Member added:\n${JSON.stringify(result, null, 2)}` },
       ],
     };
+  }
+
+  if (name === "remove_chat_member") {
+    const chat_id = args?.chat_id;
+    const agent_id = coerceAgentId(args?.agent_id);
+    if (typeof chat_id !== "string" || agent_id === null) {
+      return {
+        content: [{ type: "text", text: "✗ Required: chat_id (string), agent_id (integer or string-integer)." }],
+        isError: true,
+      };
+    }
+    const result = await removeChatMember(chat_id, agent_id);
+    return {
+      content: [
+        { type: "text", text: `✓ Member removed:\n${JSON.stringify(result, null, 2)}` },
+      ],
+    };
+  }
+
+  if (name === "spawn_agent") {
+    const chat_id = args?.chat_id;
+    const display_name = args?.display_name;
+    const bio = args?.bio;
+    const auto_launch = args?.auto_launch === true;
+    const target = (args?.target ?? "claude") as "claude" | "codex";
+    const work_dir = args?.work_dir;
+
+    if (typeof chat_id !== "string" || typeof display_name !== "string") {
+      return {
+        content: [{
+          type: "text",
+          text: "✗ Required: chat_id (string), display_name (string). bio is optional.",
+        }],
+        isError: true,
+      };
+    }
+    if (bio !== undefined && typeof bio !== "string") {
+      return {
+        content: [{ type: "text", text: "✗ bio must be a string if provided." }],
+        isError: true,
+      };
+    }
+    if (target !== "claude" && target !== "codex") {
+      return {
+        content: [{ type: "text", text: "✗ target must be \"claude\" or \"codex\"." }],
+        isError: true,
+      };
+    }
+    if (auto_launch && (typeof work_dir !== "string" || !work_dir.trim())) {
+      return {
+        content: [{
+          type: "text",
+          text: "✗ work_dir (string) is required when auto_launch=true.",
+        }],
+        isError: true,
+      };
+    }
+
+    const result: any = await spawnAgentInChat(
+      chat_id,
+      display_name,
+      bio as string | undefined,
+    );
+    const token: string | undefined = result?.auth_token;
+    const newAgentDisplayName: string = result?.display_name || display_name;
+    const onboarding_prompt = token
+      ? `You're being added to an InBetween chat as @${newAgentDisplayName}. ` +
+        `Call inbetween.agent_login with auth_token=${token} and you'll be online ` +
+        `in the chat. After login, the server pushes your role, members, and any private ` +
+        `playbook automatically — read those, then go quiet until @-mentioned.`
+      : null;
+
+    // Attempt auto-launch only for target=claude. Codex falls through to the
+    // manual-paste output below; the prompt is still useful, the human just
+    // opens the Codex window themselves.
+    let launched = false;
+    let launchInfo: string | null = null;
+    if (auto_launch && target === "claude" && onboarding_prompt) {
+      const lr = launchClaudeInNewWindow(work_dir as string, onboarding_prompt);
+      if (lr.ok) {
+        launched = true;
+        launchInfo = `✓ New Claude Code window opened in ${work_dir} (platform=${lr.platform}). The agent should come online within a few seconds.`;
+      } else {
+        launchInfo = `⚠ auto_launch failed on ${lr.platform}: ${lr.error}. Falling back to manual paste — give the prompt below to the human.`;
+      }
+    } else if (auto_launch && target === "codex") {
+      launchInfo = "ℹ codex auto-launch is not implemented yet. Give the prompt below to the human; they paste it into a fresh Codex window manually.";
+    }
+
+    const body =
+      `✓ Agent spawned:\n${JSON.stringify(result, null, 2)}\n` +
+      (launchInfo ? `\n${launchInfo}\n` : "") +
+      (onboarding_prompt
+        ? launched
+          ? "" // window already has the prompt; no need to repeat it for human
+          : `\n--- ONBOARDING PROMPT (paste into a fresh IDE) ---\n${onboarding_prompt}`
+        : "\n(no auth_token returned — backend may be misconfigured)");
+
+    return { content: [{ type: "text", text: body }] };
   }
 
   // === Privacy / DND ===
@@ -1875,7 +2186,6 @@ ${JSON.stringify(r, null, 2)}` }] };
       since: args?.since as string | undefined,
       until: args?.until as string | undefined,
       unread: args?.unread as boolean | undefined,
-      q: args?.q as string | undefined,
     });
     // Header: каждый раз когда агент читает чат, мы напоминаем ему:
     //   1. кто здесь и чем занимается (member bio + notify rules);
@@ -1910,6 +2220,7 @@ ${JSON.stringify(r, null, 2)}` }] };
       args!.content as string,
       (args!.attachments as any[]) || [],
       {},
+      typeof args?.reply_to_message_id === "string" ? args.reply_to_message_id : undefined,
     );
     return {
       content: [
@@ -1919,6 +2230,18 @@ ${JSON.stringify(r, null, 2)}` }] };
         },
       ],
     };
+  }
+  if (name === "chat_thread") {
+    const chat_id = args?.chat_id;
+    const root = args?.root_message_id;
+    if (typeof chat_id !== "string" || typeof root !== "string") {
+      return {
+        content: [{ type: "text", text: "✗ Required: chat_id (string), root_message_id (UUID string)." }],
+        isError: true,
+      };
+    }
+    const r: any = await chatThread(chat_id, root);
+    return { content: [{ type: "text", text: JSON.stringify(r.messages, null, 2) }] };
   }
   if (name === "attachment_download") {
     const messageId = args!.message_id as string;
@@ -2085,21 +2408,40 @@ ${JSON.stringify(r, null, 2)}` }] };
     return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
   }
   if (name === "set_chat_settings") {
+    // agent_id is optional — coerce both number and string-integer; reject
+    // a present-but-unparseable value with a clear message so the LLM can
+    // self-correct instead of silently editing itself.
+    let targetAgentId: number | undefined;
+    if (args?.agent_id !== undefined && args?.agent_id !== null) {
+      const coerced = coerceAgentId(args.agent_id);
+      if (coerced === null) {
+        return {
+          content: [{ type: "text", text: "✗ agent_id must be an integer or string-integer." }],
+          isError: true,
+        };
+      }
+      targetAgentId = coerced;
+    }
     await setChatSettings({
       chat_id: args!.chat_id as string,
       notify_mode: args?.notify_mode as any,
       bio: args?.bio as string | undefined,
       instructions: args?.instructions as string | undefined,
+      agent_id: targetAgentId,
     });
     // Local instant refresh: backend will ALSO push `chat_member_settings_updated`
-    // via WS, but that has network round-trip latency. Refreshing here closes
-    // the loop immediately so the next reply already uses the new playbook/bio.
-    if (args?.bio !== undefined || args?.instructions !== undefined) {
+    // via WS, but that has network round-trip latency. Only refresh locally when
+    // the write targeted ourselves — if a coordinator just rewrote a teammate's
+    // row, the teammate's MCP refreshes via the WS event; our own context block
+    // is unchanged.
+    const editedSelf = targetAgentId === undefined;
+    if (editedSelf && (args?.bio !== undefined || args?.instructions !== undefined)) {
       refreshChatContext().catch((e) =>
         console.error(`[inbetween] post-set_chat_settings context refresh threw: ${e?.message || e}`),
       );
     }
-    return { content: [{ type: "text", text: `✓ Settings saved for chat ${args!.chat_id}` }] };
+    const who = editedSelf ? "yourself" : `agent #${targetAgentId}`;
+    return { content: [{ type: "text", text: `✓ Settings saved for ${who} in chat ${args!.chat_id}` }] };
   }
   if (name === "inbox_unread") {
     const r = await inboxUnread({
