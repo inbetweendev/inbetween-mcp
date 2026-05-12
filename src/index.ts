@@ -1263,12 +1263,17 @@ async function chatSend(
   content: string,
   attachments: any[] = [],
   metadata: any = {},
+  reply_to_message_id?: string,
 ) {
-  return api("POST", `/chats/${encodeURIComponent(chat_id)}/messages`, {
-    content,
-    attachments,
-    metadata,
-  });
+  const body: any = { content, attachments, metadata };
+  if (reply_to_message_id) body.reply_to_message_id = reply_to_message_id;
+  return api("POST", `/chats/${encodeURIComponent(chat_id)}/messages`, body);
+}
+async function chatThread(chat_id: string, root_message_id: string) {
+  return api(
+    "GET",
+    `/chats/${encodeURIComponent(chat_id)}/thread/${encodeURIComponent(root_message_id)}`,
+  );
 }
 async function searchMessages(opts: {
   q: string; limit?: number; since?: string; until?: string; chat_id?: string;
@@ -1538,8 +1543,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           chat_id: { type: "string", description: "Chat id (from list_chats)" },
           content: { type: "string", description: "Message text. Include @<display_name> or @all to control routing." },
           attachments: { type: "array", items: { type: "object" }, description: "Pre-uploaded attachment objects (rare — usually you should call `attachment_send` instead which handles upload + send atomically)." },
+          reply_to_message_id: {
+            type: "string",
+            description: "Optional UUID of a parent message to reply to. The new message links to that parent and inherits its thread root, so `chat_thread` can return them together.",
+          },
         },
         required: ["chat_id", "content"],
+      },
+    },
+    {
+      name: "chat_thread",
+      description:
+        "Fetch every message in a single reply thread, in chronological order. Pass `root_message_id` — the UUID of the FIRST message in the thread (either the literal root, or any reply's `root_message_id` field). Returns the root plus every reply, flat. Useful when you receive a push that references an earlier message and you need the conversation context.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          chat_id: { type: "string", description: "Chat id." },
+          root_message_id: { type: "string", description: "UUID of the thread's root message." },
+        },
+        required: ["chat_id", "root_message_id"],
       },
     },
     // ===== Attachments =====
@@ -2061,6 +2083,7 @@ ${JSON.stringify(r, null, 2)}` }] };
       args!.content as string,
       (args!.attachments as any[]) || [],
       {},
+      typeof args?.reply_to_message_id === "string" ? args.reply_to_message_id : undefined,
     );
     return {
       content: [
@@ -2070,6 +2093,18 @@ ${JSON.stringify(r, null, 2)}` }] };
         },
       ],
     };
+  }
+  if (name === "chat_thread") {
+    const chat_id = args?.chat_id;
+    const root = args?.root_message_id;
+    if (typeof chat_id !== "string" || typeof root !== "string") {
+      return {
+        content: [{ type: "text", text: "✗ Required: chat_id (string), root_message_id (UUID string)." }],
+        isError: true,
+      };
+    }
+    const r: any = await chatThread(chat_id, root);
+    return { content: [{ type: "text", text: JSON.stringify(r.messages, null, 2) }] };
   }
   if (name === "attachment_download") {
     const messageId = args!.message_id as string;
